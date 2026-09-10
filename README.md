@@ -129,6 +129,19 @@ This cannot be bundled. Shipping a client would mean publishing its secret and p
 
 The installer handles all of these when Homebrew is available.
 
+## Publishing your own copy
+
+The package ships with an `OWNER` placeholder wherever a repository URL appears.
+Point it at your account in one command:
+
+```bash
+./scripts/set-owner.sh your-github-username
+```
+
+Then push, and both install paths work immediately — `brew install --HEAD` needs
+no release. For a tagged release, add the tarball checksum to
+`Formula/vaultsync.rb`; the file explains how.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

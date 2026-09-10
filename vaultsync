@@ -2341,8 +2341,9 @@ def cmd_uninstall(cfg, args):
     _, opts = split_args(args, {}, {"yes": "yes", "purge": "purge"})
     pairs = sorted(cfg.get("pairs", {}))
     info(color("Uninstall vaultsync", BOLD))
+    here = os.path.abspath(__file__)
     info("  stop and remove %d background agent(s)" % len(pairs))
-    info("  remove ~/.local/bin/vaultsync")
+    info("  remove %s" % here)
     if opts.get("purge"):
         info("  delete %s, including your version history" % BASE)
     else:
@@ -2356,8 +2357,8 @@ def cmd_uninstall(cfg, args):
     for name in pairs:
         remove_agent(name)
         info("  stopped %s" % name)
-    target = os.path.join(BIN_DIR, "vaultsync")
-    for candidate in (target, os.path.realpath(__file__)):
+    for candidate in (here, os.path.realpath(here),
+                      os.path.join(BIN_DIR, "vaultsync")):
         try:
             if os.path.exists(candidate) and BASE not in candidate:
                 os.unlink(candidate)

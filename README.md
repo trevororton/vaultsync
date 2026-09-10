@@ -120,7 +120,9 @@ Your vault, your Google Drive and your rclone config are never touched.
 
 ## Google API client
 
-Docs mode needs a Google API client of your own—roughly two minutes of clicking, once. See [docs/google-oauth.md](docs/google-oauth.md).
+Docs mode needs a Google API client of your own, once. A personal Gmail account works fine. See [docs/google-oauth.md](docs/google-oauth.md) for the walkthrough.
+
+One step in there is easy to skip and bites a week later: on a personal account you must **publish** the app rather than leaving it in "Testing". Google expires refresh tokens for apps in Testing after 7 days, so sync would appear to work and then stop. Publishing is a button, not a review — you never need Google's verification for your own use.
 
 This cannot be bundled. Shipping a client would mean publishing its secret and putting every user's Drive access behind one credential subject to Google's review; it is exactly why rclone's shared credential is being retired. Your own client means your notes travel only between you and Google.
 

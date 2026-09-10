@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1
+
+- Correct the Google setup guidance for personal accounts. An external OAuth app
+  left in "Testing" status is issued refresh tokens that expire after 7 days, so
+  the previous instructions produced a connection that worked and then stopped a
+  week later. The app must be published; verification is still not required.
+- Explain `invalid_grant` in plain terms when it happens, naming that cause and
+  the fix, instead of passing Google's error through.
+
 ## 1.0.0
 
 First release.

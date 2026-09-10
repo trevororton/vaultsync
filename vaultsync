@@ -18,7 +18,7 @@ Both modes give you:
 Run `vaultsync help` for usage.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 import json
 import os
@@ -738,7 +738,22 @@ def drive_token(cfg):
                 "https://oauth2.googleapis.com/token", body, timeout=60) as resp:
             data = json.load(resp)
     except Exception as exc:
-        raise DriveError("could not refresh the Google token: %s" % exc)
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")   # HTTPError body
+        except Exception:
+            detail = str(exc)
+        if "invalid_grant" in detail:
+            # The overwhelmingly common cause, and it strikes a week after a
+            # setup that appeared to work, so name it rather than echoing
+            # Google's error.
+            raise DriveError(
+                "Google has revoked this authorisation (invalid_grant). The usual "
+                "cause is an OAuth app left in 'Testing' status: Google expires "
+                "those refresh tokens after 7 days. Publish the app, then run "
+                "`rclone config reconnect %s:` — see %s"
+                % (section, DOCS_OAUTH_URL))
+        raise DriveError("could not refresh the Google token: %s" % detail[:300])
     _token["value"] = data["access_token"]
     _token["expires"] = time.time() + int(data.get("expires_in", 3600))
     return _token["value"]
@@ -1906,9 +1921,15 @@ def cmd_setup(cfg, args):
         info("     rclone config create %s drive scope drive \\" % remote)
         info("       client_id YOUR_CLIENT_ID client_secret YOUR_CLIENT_SECRET")
         info("")
-        info("   You need your own Google API client — about two minutes, and it")
-        info("   keeps your data going only between you and Google:")
+        info("   You need your own Google API client. A personal Google account")
+        info("   is fine. Walkthrough:")
         info("     %s" % DOCS_OAUTH_URL)
+        info("")
+        info(color("   One step there is easy to miss:", YELLOW) + " on a personal")
+        info("   account, publish the app instead of leaving it in \"Testing\".")
+        info("   Google expires Testing refresh tokens after 7 days, so sync")
+        info("   would work now and stop next week. Publishing is a button, not")
+        info("   a review.")
         info("")
         info(DIM + "   Then run `vaultsync setup` again." + RESET)
         return 1

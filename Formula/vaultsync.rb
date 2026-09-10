@@ -14,15 +14,15 @@
 # and `sha256` below:
 #
 #   git tag v1.0.0 && git push --tags
-#   curl -sL https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.0.tar.gz | shasum -a 256
+#   curl -sL https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.1.tar.gz | shasum -a 256
 
 class Vaultsync < Formula
   desc "Two-way sync between an Obsidian folder and Google Drive, with native Google Docs"
   homepage "https://github.com/trevororton/vaultsync"
   license "MIT"
-  version "1.0.0"
+  version "1.0.1"
 
-  url "https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.1.tar.gz"
   sha256 "833d9d2cb65a37c01531dc0d2a2737568ab7e299332eae39326a740d8e38cd87"
 
   head "https://github.com/trevororton/vaultsync.git", branch: "main"

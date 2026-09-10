@@ -13,7 +13,7 @@ That folder now exists in Drive as real Google Docs. Edit a note in Obsidian and
 ## Install
 
 ```bash
-brew tap OWNER/vaultsync
+brew tap OWNER/vaultsync https://github.com/OWNER/vaultsync
 brew install vaultsync
 ```
 

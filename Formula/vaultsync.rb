@@ -2,8 +2,12 @@
 #
 # This file makes the repository double as a Homebrew tap:
 #
-#   brew tap OWNER/vaultsync
+#   brew tap OWNER/vaultsync https://github.com/OWNER/vaultsync
 #   brew install vaultsync
+#
+# The explicit URL is needed because `brew tap OWNER/vaultsync` alone would look
+# for a repo called `homebrew-vaultsync`. Naming the repo `homebrew-vaultsync`
+# instead would let people drop the URL, at the cost of an odd repo name.
 #
 # Before the first release, `brew install --HEAD vaultsync` works with no
 # further changes. To ship a stable version, tag a release and fill in `url`

@@ -13,14 +13,14 @@ That folder now exists in Drive as real Google Docs. Edit a note in Obsidian and
 ## Install
 
 ```bash
-brew tap OWNER/vaultsync https://github.com/OWNER/vaultsync
+brew tap trevororton/vaultsync https://github.com/trevororton/vaultsync
 brew install vaultsync
 ```
 
 No Homebrew? Same result:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/vaultsync/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/trevororton/vaultsync/main/install.sh | bash
 ```
 
 Then:

@@ -2,10 +2,10 @@
 #
 # This file makes the repository double as a Homebrew tap:
 #
-#   brew tap OWNER/vaultsync https://github.com/OWNER/vaultsync
+#   brew tap trevororton/vaultsync https://github.com/trevororton/vaultsync
 #   brew install vaultsync
 #
-# The explicit URL is needed because `brew tap OWNER/vaultsync` alone would look
+# The explicit URL is needed because `brew tap trevororton/vaultsync` alone would look
 # for a repo called `homebrew-vaultsync`. Naming the repo `homebrew-vaultsync`
 # instead would let people drop the URL, at the cost of an odd repo name.
 #
@@ -14,18 +14,18 @@
 # and `sha256` below:
 #
 #   git tag v1.0.0 && git push --tags
-#   curl -sL https://github.com/OWNER/vaultsync/archive/refs/tags/v1.0.0.tar.gz | shasum -a 256
+#   curl -sL https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.0.tar.gz | shasum -a 256
 
 class Vaultsync < Formula
   desc "Two-way sync between an Obsidian folder and Google Drive, with native Google Docs"
-  homepage "https://github.com/OWNER/vaultsync"
+  homepage "https://github.com/trevororton/vaultsync"
   license "MIT"
   version "1.0.0"
 
-  url "https://github.com/OWNER/vaultsync/archive/refs/tags/v1.0.0.tar.gz"
+  url "https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.0.tar.gz"
   sha256 "REPLACE_WITH_TARBALL_SHA256"
 
-  head "https://github.com/OWNER/vaultsync.git", branch: "main"
+  head "https://github.com/trevororton/vaultsync.git", branch: "main"
 
   depends_on :macos
   depends_on "rclone"

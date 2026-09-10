@@ -2,14 +2,14 @@
 #
 # vaultsync installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/vaultsync/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/trevororton/vaultsync/main/install.sh | bash
 #
 # Installs vaultsync into ~/.local/bin, pulls in what it needs, and then hands
 # you to `vaultsync setup`. Nothing runs in the background until you ask it to.
 
 set -euo pipefail
 
-REPO="${VAULTSYNC_REPO:-OWNER/vaultsync}"
+REPO="${VAULTSYNC_REPO:-trevororton/vaultsync}"
 BRANCH="${VAULTSYNC_BRANCH:-main}"
 BIN_DIR="${VAULTSYNC_BIN_DIR:-$HOME/.local/bin}"
 RAW="https://raw.githubusercontent.com/$REPO/$BRANCH/vaultsync"

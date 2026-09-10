@@ -45,7 +45,7 @@ AGENTS_DIR = os.path.join(HOME, "Library", "LaunchAgents")
 BIN_DIR = os.path.join(HOME, ".local", "bin")
 
 LABEL_PREFIX = "com.vaultsync"
-DOCS_OAUTH_URL = ("https://github.com/OWNER/vaultsync/blob/main/docs/google-oauth.md")
+DOCS_OAUTH_URL = ("https://github.com/trevororton/vaultsync/blob/main/docs/google-oauth.md")
 CONFLICT_SUFFIX = ".vsconflict"
 MAX_LOG_BYTES = 5 * 1024 * 1024
 

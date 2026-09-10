@@ -1,0 +1,2895 @@
+#!/usr/bin/env python3
+"""
+vaultsync — two-way mirror between a local vault folder and Google Drive.
+
+Two modes per folder:
+  files — plain files both ways, driven by `rclone bisync`
+  docs  — each note lives in Drive as a native Google Doc you can share and
+          comment on, driven by the Drive API directly
+
+Both modes give you:
+  - newest-timestamp-wins conflict resolution, so folders stay clean, except
+    for shared Docs, where both versions are kept instead
+  - a browsable version history, so anything overwritten or deleted is
+    archived rather than destroyed
+  - a per-folder background daemon (FSEvents watch + interval poll) run by
+    launchd, under an interpreter macOS allows to read ~/Documents
+
+Run `vaultsync help` for usage.
+"""
+
+__version__ = "1.0.0"
+
+import json
+import os
+import plistlib
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, ".vaultsync")
+CONFIG_PATH = os.path.join(BASE, "config.json")
+FILTERS_PATH = os.path.join(BASE, "filters.txt")
+LOGS_DIR = os.path.join(BASE, "logs")
+HISTORY_DIR = os.path.join(BASE, "history")
+STATE_DIR = os.path.join(BASE, "state")
+LOCKS_DIR = os.path.join(BASE, "locks")
+WORKDIR = os.path.join(BASE, "rclone-work")
+AGENTS_DIR = os.path.join(HOME, "Library", "LaunchAgents")
+BIN_DIR = os.path.join(HOME, ".local", "bin")
+
+LABEL_PREFIX = "com.vaultsync"
+DOCS_OAUTH_URL = ("https://github.com/OWNER/vaultsync/blob/main/docs/google-oauth.md")
+CONFLICT_SUFFIX = ".vsconflict"
+MAX_LOG_BYTES = 5 * 1024 * 1024
+
+DEFAULT_CONFIG = {
+    "remote": "gdrive",
+    "remote_base": "VaultSync",
+    "remote_history_base": "VaultSyncHistory",
+    "vault_root": "",
+    "rclone": "",
+    "fswatch": "",
+    "history_days": 30,
+    "pairs": {},
+}
+
+DEFAULT_FILTERS = """\
+# vaultsync filter rules (rclone filter syntax: '-' excludes, '+' includes).
+# Patterns without a leading '/' match at any depth.
+# Editing this file requires a re-baseline: `vaultsync resync <pair>`.
+
+- .DS_Store
+- ._*
+- .Spotlight-V100/**
+- .fseventsd/**
+- .TemporaryItems/**
+- .Trashes/**
+- .trash/**
+- .git/**
+- .obsidian/workspace*.json
+- .obsidian/cache/**
+- *.tmp
+- *.swp
+- ~$*
+"""
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
+
+def color(s, c):
+    return s if not sys.stdout.isatty() else c + s + RESET
+
+
+def die(msg, code=1):
+    print(color("error: ", RED) + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(msg)
+
+
+# ---------------------------------------------------------------- config
+
+
+def ensure_dirs():
+    for d in (BASE, LOGS_DIR, HISTORY_DIR, STATE_DIR, LOCKS_DIR, WORKDIR):
+        os.makedirs(d, exist_ok=True)
+
+
+def load_config():
+    ensure_dirs()
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    if not os.path.exists(FILTERS_PATH):
+        with open(FILTERS_PATH, "w") as f:
+            f.write(DEFAULT_FILTERS)
+    return cfg
+
+
+def save_config(cfg):
+    ensure_dirs()
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def find_binary(cfg, key, name):
+    """Resolve a tool path, tolerating launchd's minimal PATH."""
+    cached = cfg.get(key) or ""
+    if cached and os.path.exists(cached):
+        return cached
+    found = shutil.which(name)
+    if not found:
+        for cand in ("/opt/homebrew/bin/" + name, "/usr/local/bin/" + name):
+            if os.path.exists(cand):
+                found = cand
+                break
+    if found and found != cached:
+        cfg[key] = found
+        save_config(cfg)
+    return found
+
+
+# macOS privacy protection (TCC) blocks Apple's bundled /usr/bin/python3 from
+# reading ~/Documents when it runs as a launchd agent, and os.walk reports that
+# as an empty folder. A Homebrew interpreter is permitted, so the background
+# daemon must run under one.
+PYTHON_CANDIDATES = (
+    "/opt/homebrew/bin/python3",
+    "/opt/homebrew/opt/python@3.13/bin/python3.13",
+    "/opt/homebrew/opt/python@3.12/bin/python3.12",
+    "/opt/homebrew/opt/python@3.11/bin/python3.11",
+    "/usr/local/bin/python3",
+)
+
+
+def daemon_python(cfg):
+    """Interpreter for the background agent, and whether it is a safe choice."""
+    cached = cfg.get("python") or ""
+    if cached and os.path.exists(cached):
+        return cached, True
+    for cand in PYTHON_CANDIDATES:
+        if os.path.exists(cand):
+            cfg["python"] = cand
+            save_config(cfg)
+            return cand, True
+    return sys.executable, False
+
+
+def rclone_bin(cfg, required=True):
+    path = find_binary(cfg, "rclone", "rclone")
+    if not path and required:
+        die("rclone not found. Install it with:  brew install rclone")
+    return path
+
+
+VAULT_SEARCH_ROOTS = (
+    os.path.join(HOME, "Documents"),
+    os.path.join(HOME, "Library", "Mobile Documents", "iCloud~md~obsidian",
+                 "Documents"),
+    os.path.join(HOME, "Obsidian"),
+    os.path.join(HOME, "Notes"),
+    HOME,
+)
+
+
+def detect_vaults(limit_depth=4):
+    """Obsidian vaults on this machine, newest first.
+
+    A vault is any directory containing `.obsidian`. Nothing is assumed about
+    where the user keeps them.
+    """
+    found = []
+    seen = set()
+    for root in VAULT_SEARCH_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        base_depth = root.rstrip(os.sep).count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root):
+            depth = dirpath.count(os.sep) - base_depth
+            if depth >= limit_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") or d == ".obsidian"]
+            if ".obsidian" in dirnames:
+                real = os.path.realpath(dirpath)
+                if real not in seen:
+                    seen.add(real)
+                    found.append(real)
+                dirnames[:] = [d for d in dirnames if d != ".obsidian"]
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found
+
+
+def resolve_vault_root(cfg, quiet=False):
+    """Where folders named on the command line are looked up."""
+    configured = cfg.get("vault_root") or ""
+    if configured and os.path.isdir(configured):
+        return configured
+    vaults = detect_vaults()
+    if len(vaults) == 1:
+        cfg["vault_root"] = vaults[0]
+        save_config(cfg)
+        if not quiet:
+            info(DIM + "Using vault: %s" % vaults[0] + RESET)
+        return vaults[0]
+    if not vaults:
+        return ""
+    if not quiet:
+        info("Found several vaults. Name one as your default:")
+        for v in vaults[:8]:
+            info("    vaultsync vault %s" % shell_quote(v))
+    return ""
+
+
+def shell_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'" if " " in str(value) \
+        else str(value)
+
+
+def slug(name):
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()
+    return s or "pair"
+
+
+def get_pair(cfg, name):
+    pairs = cfg["pairs"]
+    if name in pairs:
+        return name, pairs[name]
+    matches = [k for k in pairs if k.startswith(name)]
+    if len(matches) == 1:
+        return matches[0], pairs[matches[0]]
+    if len(matches) > 1:
+        die("ambiguous pair '%s' (matches: %s)" % (name, ", ".join(sorted(matches))))
+    die("no such pair: %s  (see: vaultsync list)" % name)
+
+
+def resolve_pair_arg(cfg, args, required=True):
+    """Return (name, pair). With no arg, use the only pair if there is just one."""
+    args = [a for a in (args or []) if not a.startswith("-")]
+    if args:
+        return get_pair(cfg, args[0])
+    pairs = cfg["pairs"]
+    if len(pairs) == 1:
+        only = next(iter(pairs))
+        return only, pairs[only]
+    if not pairs and required:
+        die("no folders configured yet. Add one with:  vaultsync add \"<Folder>\"")
+    if required:
+        die("multiple folders configured — name one: %s" % ", ".join(sorted(pairs)))
+    return None, None
+
+
+# ---------------------------------------------------------------- logging
+
+
+def log_path(name):
+    return os.path.join(LOGS_DIR, name + ".log")
+
+
+def write_log(name, text):
+    ensure_dirs()
+    path = log_path(name)
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    with open(path, "a") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+
+
+def log_event(name, msg):
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_log(name, "[%s] %s" % (stamp, msg))
+
+
+def state_path(name):
+    return os.path.join(STATE_DIR, name + ".json")
+
+
+def read_state(name):
+    try:
+        with open(state_path(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(name, state):
+    ensure_dirs()
+    tmp = state_path(name) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, state_path(name))
+
+
+# ---------------------------------------------------------------- locking
+
+
+class Lock(object):
+    """Cooperative per-pair lock so the daemon and a manual run never overlap."""
+
+    def __init__(self, name, wait=0):
+        self.path = os.path.join(LOCKS_DIR, name + ".lock")
+        self.wait = wait
+        self.fd = None
+
+    def __enter__(self):
+        ensure_dirs()
+        deadline = time.time() + self.wait
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode())
+                return self
+            except FileExistsError:
+                if self._stale():
+                    continue
+                if time.time() >= deadline:
+                    raise RuntimeError("another vaultsync run holds the lock")
+                time.sleep(1)
+
+    def _stale(self):
+        try:
+            with open(self.path) as f:
+                pid = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            pid = 0
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if not alive:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+            return True
+        return False
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        return False
+
+
+# ---------------------------------------------------------------- sync
+
+
+def run_rclone(cfg, argv, capture=True):
+    binary = rclone_bin(cfg)
+    proc = subprocess.run(
+        [binary] + argv,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+        universal_newlines=True,
+    )
+    return proc.returncode, (proc.stdout or "")
+
+
+# rclone prefixes every log line with a timestamp and writes them to stderr.
+# Machine-readable output must never be read from the merged stream.
+RCLONE_LOG_LINE = re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ")
+
+
+def rclone_lines(cfg, argv):
+    """Run rclone for machine-readable output: stdout only, log lines stripped."""
+    binary = rclone_bin(cfg)
+    proc = subprocess.run(
+        [binary] + argv,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        universal_newlines=True,
+    )
+    lines = [l.strip() for l in (proc.stdout or "").splitlines() if l.strip()]
+    lines = [l for l in lines if not RCLONE_LOG_LINE.match(l)]
+    return proc.returncode, lines, (proc.stderr or "")
+
+
+def history_run_dir(name, stamp):
+    return os.path.join(HISTORY_DIR, name, stamp)
+
+
+def remote_history(cfg, pair, name, stamp):
+    return "%s:%s/%s/%s" % (cfg["remote"], cfg["remote_history_base"], name, stamp)
+
+
+def bisync_argv(cfg, pair, name, stamp, resync=False, dry_run=False):
+    local = pair["local"]
+    remote = pair["remote"]
+    argv = [
+        "bisync",
+        local,
+        remote,
+        "--filters-file", FILTERS_PATH,
+        "--workdir", WORKDIR,
+        "--compare", "size,modtime",
+        "--modify-window", "1s",
+        "--conflict-resolve", "newer",
+        "--conflict-loser", "pathname",
+        "--conflict-suffix", CONFLICT_SUFFIX.lstrip("."),
+        "--backup-dir1", os.path.join(history_run_dir(name, stamp), "local"),
+        "--backup-dir2", remote_history(cfg, pair, name, stamp),
+        "--max-delete", str(pair.get("max_delete", 25)),
+        # Without this, an interrupted run leaves a lock that never expires and
+        # every later sync fails. bisync renews it while a run is alive.
+        "--max-lock", "15m",
+        "--create-empty-src-dirs",
+        "--drive-skip-gdocs",
+        "--resilient",
+        "--recover",
+        "--metadata",
+        "--transfers", "8",
+        "--checkers", "16",
+        "--log-level", "INFO",
+    ]
+    if resync:
+        argv += ["--resync", "--resync-mode", "newer"]
+    if dry_run:
+        argv += ["--dry-run"]
+    return argv
+
+
+LOCK_MSG = "prior lock file found"
+LCK_PATH_RE = re.compile(r"(/[^\s\x1b\"]+\.lck)")
+
+
+def clear_stale_bisync_lock(name, out):
+    """Delete a bisync lock left behind by a killed run.
+
+    rclone refuses to sync while a lock exists. If the process that made it is
+    gone, the lock is meaningless and syncing would stay broken until someone
+    removed it by hand.
+    """
+    if LOCK_MSG not in out:
+        return False
+    match = LCK_PATH_RE.search(out)
+    if not match:
+        return False
+    path = match.group(1)
+    if not os.path.exists(path):
+        return False
+    pid = None
+    try:
+        with open(path) as f:
+            pid = int(json.load(f).get("PID") or 0)
+    except (OSError, ValueError, AttributeError):
+        pid = None
+    if pid:
+        try:
+            os.kill(pid, 0)
+            log_event(name, "LOCK held by live pid %d — leaving it alone" % pid)
+            return False  # a real run is in progress
+        except OSError:
+            pass
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    log_event(name, "LOCK cleared stale lock from dead pid %s" % (pid or "unknown"))
+    return True
+
+
+def sweep_conflicts(cfg, pair, name, stamp, check_remote=True):
+    """Move conflict artifacts out of the live folders into version history.
+
+    rclone writes the losing copy of a conflict alongside the winner. We keep the
+    folders clean by relocating those losers into the history archive, so the
+    discarded version is still recoverable.
+    """
+    moved = []
+    local = pair["local"]
+    dest_root = os.path.join(history_run_dir(name, stamp), "conflicts")
+
+    for root, dirs, files in os.walk(local):
+        dirs[:] = [d for d in dirs if d not in (".git",)]
+        for fn in files:
+            if CONFLICT_SUFFIX.lstrip(".") not in fn:
+                continue
+            src = os.path.join(root, fn)
+            rel = os.path.relpath(src, local)
+            dest = os.path.join(dest_root, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(src, dest)
+            moved.append(rel)
+
+    # Same sweep on the Drive side: archive within Drive, then remove from the
+    # live remote folder so both sides stay clean. Skipped unless this run
+    # actually hit a conflict, to avoid a Drive listing on every quiet sync.
+    if not check_remote:
+        return moved
+    code, remote_hits, err = rclone_lines(cfg, [
+        "lsf", "--files-only", "-R",
+        "--include", "*" + CONFLICT_SUFFIX + "*",
+        pair["remote"],
+    ])
+    if code != 0:
+        log_event(name, "WARN could not list remote for conflicts: %s"
+                  % summarize_error(err))
+        return moved
+    for rel in remote_hits:
+        if CONFLICT_SUFFIX.lstrip(".") not in rel:
+            continue  # never act on a line that isn't a conflict artifact
+        src = pair["remote"].rstrip("/") + "/" + rel
+        dst = remote_history(cfg, pair, name, stamp) + "/conflicts/" + rel
+        mv_code, mv_out = run_rclone(cfg, ["moveto", src, dst, "--retries", "1"])
+        if mv_code != 0:
+            log_event(name, "WARN could not archive remote conflict %s: %s"
+                      % (rel, summarize_error(mv_out)))
+        elif rel not in moved:
+            moved.append(rel)
+    return moved
+
+
+def prune_empty_history(name, stamp):
+    """Drop the run's history folder if nothing was archived."""
+    run_dir = history_run_dir(name, stamp)
+    if not os.path.isdir(run_dir):
+        return
+    for root, dirs, files in os.walk(run_dir, topdown=False):
+        if not os.listdir(root):
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+
+def sync_once(cfg, name, pair, dry_run=False, force_resync=False, quiet=False):
+    if pair.get("mode") == "docs":
+        return sync_docs(cfg, name, pair, dry_run=dry_run, quiet=quiet)
+    local = pair["local"]
+    if not os.path.isdir(local):
+        msg = "local folder is missing: %s — refusing to sync (this would delete the Drive copy)" % local
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    state = read_state(name)
+    resync = force_resync or not state.get("baselined")
+
+    if resync and not quiet:
+        info(color("First sync for '%s' — establishing a baseline." % name, YELLOW))
+        info(DIM + "Where a file exists on both sides, the newer copy wins." + RESET)
+
+    argv = bisync_argv(cfg, pair, name, stamp, resync=resync, dry_run=dry_run)
+    started = time.time()
+    log_event(name, "RUN %s" % ("resync" if resync else "bisync") +
+              (" (dry-run)" if dry_run else ""))
+    code, out = run_rclone(cfg, argv)
+    if code != 0 and clear_stale_bisync_lock(name, out):
+        write_log(name, out)
+        if not quiet:
+            info(DIM + "Cleared a lock left by an interrupted run; retrying."
+                 + RESET)
+        code, out = run_rclone(cfg, argv)
+    elapsed = time.time() - started
+    write_log(name, out)
+
+    conflicts = []
+    if code == 0 and not dry_run:
+        conflicts = sweep_conflicts(
+            cfg, pair, name, stamp, check_remote="onflict" in out)
+        if conflicts:
+            log_event(name, "CONFLICT archived %d file(s): %s"
+                      % (len(conflicts), ", ".join(conflicts[:10])))
+        prune_empty_history(name, stamp)
+        state["baselined"] = True
+
+    state.update({
+        "last_run": datetime.now().isoformat(timespec="seconds"),
+        "last_code": code,
+        "last_seconds": round(elapsed, 1),
+        "last_kind": "resync" if resync else "bisync",
+        "last_conflicts": conflicts,
+        "last_dry_run": bool(dry_run),
+    })
+    if code == 0:
+        state["last_success"] = state["last_run"]
+    else:
+        state["last_error"] = summarize_error(out)
+    if not dry_run:
+        write_state(name, state)
+
+    log_event(name, "DONE code=%d in %.1fs" % (code, elapsed))
+
+    if not quiet:
+        transferred = parse_transfers(out)
+        if code == 0:
+            summary = "synced '%s' in %.1fs" % (name, elapsed)
+            if transferred:
+                summary += " — " + transferred
+            info(color("ok  ", GREEN) + summary)
+            if conflicts:
+                info(color("  %d conflict(s) resolved (newer copy kept); older "
+                           "version archived:" % len(conflicts), YELLOW))
+                for rel in conflicts[:10]:
+                    info("    " + rel)
+                info(DIM + "  recover with: vaultsync history %s" % name + RESET)
+        else:
+            print(color("failed  ", RED) + "'%s' exited %d" % (name, code),
+                  file=sys.stderr)
+            print(indent(summarize_error(out)), file=sys.stderr)
+            print(DIM + "full log: vaultsync logs %s" % name + RESET,
+                  file=sys.stderr)
+    return code, out
+
+
+def parse_transfers(out):
+    files = None
+    for line in reversed(out.splitlines()):
+        m = re.search(r"Transferred:\s+(\d+)\s*/\s*(\d+),", line)
+        if m:
+            files = m.group(2)
+            break
+    if files in (None, "0"):
+        return "no changes" if files == "0" else ""
+    return "%s file(s) transferred" % files
+
+
+def summarize_error(out):
+    lines = [l for l in out.splitlines() if re.search(r"ERROR|CRITICAL|NOTICE", l)]
+    if not lines:
+        lines = out.strip().splitlines()[-6:]
+    return "\n".join(lines[-8:])
+
+
+def indent(text, prefix="  "):
+    return "\n".join(prefix + l for l in text.splitlines())
+
+
+# ---------------------------------------------------------------- docs engine
+#
+# Google Docs mode. A vault note lives in Drive as a native Google Doc, so it
+# can be shared and commented on, and edits made there come back to the vault.
+#
+# Two hard-won constraints shape this code.
+#
+# 1. A Doc has no stable bytes. Exporting one never reproduces the markdown that
+#    made it (Google escapes punctuation, appends hard line breaks, collapses
+#    soft breaks). Comparing content across sides would therefore report a
+#    change on every poll, forever. Change detection is one-sided instead: we
+#    remember the local hash and the Doc's modified time we last settled on, and
+#    ask only "did this side move since then".
+#
+# 2. Docs must be addressed by file ID, never by name. Drive permits duplicate
+#    names, and a plain `foo.md` and a Doc named `foo` can present the same name
+#    to a name-based tool. An earlier version of this engine drove rclone by
+#    name and produced duplicate Docs that then trashed each other. So this
+#    talks to the Drive API directly and every operation names an ID.
+
+GDOC_MIME = "application/vnd.google-apps.document"
+FOLDER_MIME = "application/vnd.google-apps.folder"
+MD_MIME = "text/markdown"
+KEEPBOTH_MARK = ".from-google-doc-"
+DRIVE_API = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD = "https://www.googleapis.com/upload/drive/v3"
+SKIP_NAMES = (".DS_Store", "Icon\r")
+
+# Punctuation Google escapes on export. Unescaping keeps vault markdown readable.
+UNESCAPE_RE = re.compile(r"\\([.\-+#()\[\]!|_*`>~])")
+TABLE_RULE_RE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+
+
+class DriveError(Exception):
+    pass
+
+
+_token = {"value": None, "expires": 0.0}
+
+
+def drive_token(cfg):
+    """Access token, borrowed from the rclone remote's own credentials."""
+    if _token["value"] and time.time() < _token["expires"] - 60:
+        return _token["value"]
+    import configparser
+    conf = configparser.ConfigParser()
+    conf.read(os.path.expanduser("~/.config/rclone/rclone.conf"))
+    section = cfg.get("remote", "gdrive")
+    if section not in conf:
+        raise DriveError("no rclone remote named '%s' — run: vaultsync setup" % section)
+    entry = conf[section]
+    try:
+        saved = json.loads(entry["token"])
+    except (KeyError, ValueError):
+        raise DriveError("remote '%s' has no usable token — run: vaultsync setup"
+                         % section)
+    if not entry.get("client_id"):
+        raise DriveError("remote '%s' has no client_id of its own; docs mode needs "
+                         "one (see: vaultsync setup)" % section)
+    import urllib.parse
+    import urllib.request
+    body = urllib.parse.urlencode({
+        "client_id": entry["client_id"],
+        "client_secret": entry.get("client_secret", ""),
+        "refresh_token": saved["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+    try:
+        with urllib.request.urlopen(
+                "https://oauth2.googleapis.com/token", body, timeout=60) as resp:
+            data = json.load(resp)
+    except Exception as exc:
+        raise DriveError("could not refresh the Google token: %s" % exc)
+    _token["value"] = data["access_token"]
+    _token["expires"] = time.time() + int(data.get("expires_in", 3600))
+    return _token["value"]
+
+
+def drive_request(cfg, method, url, params=None, body=None, headers=None,
+                  raw=False, tries=4):
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    last = None
+    for attempt in range(tries):
+        req = urllib.request.Request(url, data=body, method=method)
+        req.add_header("Authorization", "Bearer " + drive_token(cfg))
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                payload = resp.read()
+            if raw:
+                return payload
+            return json.loads(payload) if payload else {}
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read()[:400].decode("utf-8", "replace")
+            except Exception:
+                pass
+            last = "HTTP %s %s" % (exc.code, detail)
+            if exc.code in (403, 429, 500, 502, 503, 504) and attempt < tries - 1:
+                if exc.code == 401:
+                    _token["value"] = None
+                time.sleep(2 ** attempt)
+                continue
+            if exc.code == 401:
+                _token["value"] = None
+                if attempt < tries - 1:
+                    continue
+            raise DriveError("%s %s failed: %s" % (method, url.split("?")[0], last))
+        except Exception as exc:
+            last = str(exc)
+            if attempt < tries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise DriveError("%s %s failed: %s" % (method, url.split("?")[0], last))
+    raise DriveError(last or "request failed")
+
+
+def drive_multipart(cfg, method, url, meta, payload, media_mime):
+    boundary = "----vaultsync%d" % int(time.time() * 1e6)
+    body = (("--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+             % boundary).encode()
+            + json.dumps(meta).encode()
+            + ("\r\n--%s\r\nContent-Type: %s\r\n\r\n" % (boundary, media_mime)).encode()
+            + payload
+            + ("\r\n--%s--\r\n" % boundary).encode())
+    return drive_request(cfg, method, url, {"uploadType": "multipart"}, body,
+                         {"Content-Type": "multipart/related; boundary=" + boundary})
+
+
+def _q(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def drive_children(cfg, folder_id):
+    out, page = [], None
+    fields = ("nextPageToken,files(id,name,mimeType,modifiedTime,md5Checksum,"
+              "size,trashed,permissions(type,role,emailAddress))")
+    while True:
+        params = {"q": "%s in parents and trashed=false" % _q(folder_id),
+                  "fields": fields, "pageSize": 1000}
+        if page:
+            params["pageToken"] = page
+        res = drive_request(cfg, "GET", DRIVE_API + "/files", params)
+        out.extend(res.get("files", []))
+        page = res.get("nextPageToken")
+        if not page:
+            return out
+
+
+def drive_find_child(cfg, parent_id, name, folder=False):
+    q = "name=%s and %s in parents and trashed=false" % (_q(name), _q(parent_id))
+    if folder:
+        q += " and mimeType=%s" % _q(FOLDER_MIME)
+    res = drive_request(cfg, "GET", DRIVE_API + "/files",
+                        {"q": q, "fields": "files(id,name,mimeType)"})
+    files = res.get("files", [])
+    return files[0] if files else None
+
+
+def drive_make_folder(cfg, parent_id, name):
+    return drive_request(cfg, "POST", DRIVE_API + "/files", None,
+                         json.dumps({"name": name, "mimeType": FOLDER_MIME,
+                                     "parents": [parent_id]}).encode(),
+                         {"Content-Type": "application/json"})["id"]
+
+
+def drive_folder_for_path(cfg, path, create=True):
+    parent = "root"
+    for part in [p for p in path.split("/") if p]:
+        found = drive_find_child(cfg, parent, part, folder=True)
+        if found:
+            parent = found["id"]
+        elif create:
+            parent = drive_make_folder(cfg, parent, part)
+        else:
+            return None
+    return parent
+
+
+def remote_path_of(cfg, pair):
+    remote = pair["remote"]
+    if ":" in remote:
+        prefix, path = remote.split(":", 1)
+        if prefix and prefix != cfg.get("remote", "gdrive"):
+            raise DriveError("docs mode expects remote '%s:', but this pair uses "
+                             "'%s:'" % (cfg.get("remote", "gdrive"), prefix))
+        return path.strip("/")
+    return remote.strip("/")
+
+
+def drive_create_doc(cfg, parent_id, name, local_path):
+    with open(local_path, "rb") as f:
+        payload = f.read()
+    return drive_multipart(cfg, "POST", DRIVE_UPLOAD + "/files",
+                           {"name": name, "mimeType": GDOC_MIME,
+                            "parents": [parent_id]}, payload, MD_MIME)
+
+
+def drive_update_doc(cfg, file_id, local_path):
+    """Replace a Doc's content from markdown, by ID. The Doc keeps its identity,
+    so sharing, comments and Drive revision history all survive."""
+    with open(local_path, "rb") as f:
+        payload = f.read()
+    return drive_request(cfg, "PATCH", DRIVE_UPLOAD + "/files/" + file_id,
+                         {"uploadType": "media"}, payload,
+                         {"Content-Type": MD_MIME})
+
+
+def drive_export_doc(cfg, file_id, dest_path, normalize=True):
+    data = drive_request(cfg, "GET", DRIVE_API + "/files/" + file_id + "/export",
+                         {"mimeType": MD_MIME}, raw=True)
+    text = data.decode("utf-8", "replace")
+    if normalize:
+        text = normalize_export(text)
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    with open(dest_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def guess_mime(path):
+    import mimetypes
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+
+def drive_create_file(cfg, parent_id, name, local_path):
+    with open(local_path, "rb") as f:
+        payload = f.read()
+    return drive_multipart(cfg, "POST", DRIVE_UPLOAD + "/files",
+                           {"name": name, "parents": [parent_id]},
+                           payload, guess_mime(local_path))
+
+
+def drive_update_file(cfg, file_id, local_path):
+    with open(local_path, "rb") as f:
+        payload = f.read()
+    return drive_request(cfg, "PATCH", DRIVE_UPLOAD + "/files/" + file_id,
+                         {"uploadType": "media"}, payload,
+                         {"Content-Type": guess_mime(local_path)})
+
+
+def drive_download(cfg, file_id, dest_path):
+    data = drive_request(cfg, "GET", DRIVE_API + "/files/" + file_id,
+                         {"alt": "media"}, raw=True)
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    with open(dest_path, "wb") as f:
+        f.write(data)
+
+
+def drive_trash(cfg, file_id):
+    return drive_request(cfg, "PATCH", DRIVE_API + "/files/" + file_id, None,
+                         json.dumps({"trashed": True}).encode(),
+                         {"Content-Type": "application/json"})
+
+
+def drive_rename(cfg, file_id, name):
+    return drive_request(cfg, "PATCH", DRIVE_API + "/files/" + file_id, None,
+                         json.dumps({"name": name}).encode(),
+                         {"Content-Type": "application/json"})
+
+
+# ---------------------------------------------------------------- docs state
+
+
+def docs_state_path(name):
+    return os.path.join(STATE_DIR, name + ".docs.json")
+
+
+def read_docs_state(name):
+    try:
+        with open(docs_state_path(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_docs_state(name, state):
+    ensure_dirs()
+    tmp = docs_state_path(name) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, docs_state_path(name))
+
+
+def file_sha(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_md5(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def normalize_export(text):
+    """Undo the cosmetic drift Google adds when exporting a Doc to markdown.
+
+    Content is untouched; this only keeps vault markdown readable and stable.
+    One kind of drift cannot be undone: Google collapses a soft line break
+    inside a paragraph into a space, and that information is simply gone.
+    """
+    out = []
+    for line in text.split("\n"):
+        line = line.rstrip()            # drops the two-space hard line breaks
+        if line.strip() == ">":         # stray blockquote marker
+            continue
+        line = UNESCAPE_RE.sub(r"\1", line)
+        if TABLE_RULE_RE.match(line):   # '| :---- | :---- |' -> '| :--- | :--- |'
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            rebuilt = []
+            for cell in cells:
+                left = cell.startswith(":")
+                right = cell.endswith(":") and len(cell) > 1
+                rebuilt.append(("%s---%s" % (":" if left else "",
+                                             ":" if right else "")))
+            line = "| " + " | ".join(rebuilt) + " |"
+        out.append(line)
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.rstrip("\n") + "\n"
+
+
+def scan_local_md(local, want_md=True, errors=None):
+    """Local files, split by kind. Markdown becomes Google Docs; anything else
+    (images, PDFs) is carried through as an ordinary file so the folder stays a
+    complete mirror.
+
+    os.walk hides permission errors by default and simply yields nothing, which
+    would look exactly like "the user deleted everything". Collect them instead.
+    """
+    found = {}
+
+    def on_error(exc):
+        if errors is not None:
+            errors.append(exc)
+
+    for root, dirs, files in os.walk(local, onerror=on_error):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in files:
+            if fn.startswith(".") or fn in SKIP_NAMES or KEEPBOTH_MARK in fn:
+                continue
+            if fn.endswith(".md") != want_md:
+                continue
+            path = os.path.join(root, fn)
+            rel = os.path.relpath(path, local)
+            found[rel] = {"path": path, "hash": file_sha(path),
+                          "mtime": os.path.getmtime(path)}
+    return found
+
+
+def doc_is_shared(entry):
+    """Is this Doc visible to anyone besides its owner? Read from Drive, so
+    there is nothing for the user to label by hand."""
+    raw = entry.get("permissions")
+    if raw is None:
+        raw = (entry.get("Metadata") or {}).get("permissions")
+    if not raw:
+        return False
+    try:
+        perms = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        return False
+    for p in perms or []:
+        if p.get("type") in ("anyone", "domain", "group"):
+            return True
+        if p.get("type") == "user" and p.get("role") != "owner":
+            return True
+    return False
+
+
+def scan_remote_docs(cfg, pair):
+    """Walk the Drive folder by ID.
+
+    Returns (docs, strays, plain, folders) keyed by vault-relative path:
+      docs   — native Google Docs, one per note
+      strays — plain .md files that should be Docs in this mode
+      plain  — non-markdown files carried through as-is
+      folders— relative directory -> Drive folder ID, for creating children
+    """
+    root_path = remote_path_of(cfg, pair)
+    root_id = drive_folder_for_path(cfg, root_path, create=True)
+    docs, strays, plain, folders = {}, {}, {}, {"": root_id}
+
+    def walk(folder_id, prefix):
+        for item in drive_children(cfg, folder_id):
+            name = item.get("name") or ""
+            if name.startswith(".") or name in SKIP_NAMES:
+                continue
+            rel = prefix + name
+            mime = item.get("mimeType")
+            if mime == FOLDER_MIME:
+                folders[rel] = item["id"]
+                walk(item["id"], rel + "/")
+            elif mime == GDOC_MIME:
+                # A Doc is named after the note without its extension. Docs made
+                # by Drive's web UI keep the '.md', and are adopted as-is.
+                legacy = name.endswith(".md")
+                key = rel if legacy else rel + ".md"
+                docs[key] = {"id": item["id"], "name": name,
+                             "mtime": item.get("modifiedTime"),
+                             "shared": doc_is_shared(item),
+                             "legacy_name": legacy}
+            elif name.endswith(".md"):
+                strays[rel] = {"id": item["id"], "name": name}
+            else:
+                plain[rel] = {"id": item["id"], "mtime": item.get("modifiedTime"),
+                              "md5": item.get("md5Checksum"),
+                              "size": item.get("size")}
+
+    walk(root_id, "")
+    return docs, strays, plain, folders
+
+
+def ensure_remote_dir(cfg, folders, rel):
+    """Folder ID for the directory holding `rel`, creating parents as needed."""
+    sub = os.path.dirname(rel)
+    if sub in folders:
+        return folders[sub]
+    parent = folders[""]
+    walked = ""
+    for part in [p for p in sub.split("/") if p]:
+        walked = (walked + "/" + part) if walked else part
+        if walked in folders:
+            parent = folders[walked]
+            continue
+        found = drive_find_child(cfg, parent, part, folder=True)
+        parent = found["id"] if found else drive_make_folder(cfg, parent, part)
+        folders[walked] = parent
+    return parent
+
+
+def archive_local(name, stamp, local_root, rel):
+    src = os.path.join(local_root, rel)
+    if not os.path.exists(src):
+        return
+    dest = os.path.join(history_run_dir(name, stamp), "local", rel)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(src, dest)
+
+
+def archive_doc(cfg, name, stamp, rel, doc_id):
+    """Save the Doc's current text into history before it is overwritten."""
+    dest = os.path.join(history_run_dir(name, stamp), "gdoc", rel)
+    try:
+        drive_export_doc(cfg, doc_id, dest)
+        return True
+    except DriveError:
+        return False
+
+
+def archive_remote_file(cfg, name, stamp, rel, file_id):
+    dest = os.path.join(history_run_dir(name, stamp), "gdrive", rel)
+    try:
+        drive_download(cfg, file_id, dest)
+        return True
+    except DriveError:
+        return False
+
+
+def doc_export_text(cfg, doc_id):
+    """The Doc's current content as normalized markdown."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="vaultsync-exp-")
+    try:
+        probe = os.path.join(tmp, "doc.md")
+        drive_export_doc(cfg, doc_id, probe)
+        with open(probe, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def text_fingerprint(text):
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def doc_is_echo(cfg, entry, doc_id):
+    """Is the Doc's newer timestamp just our own write coming back?
+
+    Compared against the export we last settled on, not against the local file.
+    Google's export is never byte-identical to the markdown that made it, so
+    comparing to the local file would call every one of our own writes a change
+    and slowly grind the note's formatting down.
+    """
+    known = entry.get("doc_export_hash")
+    if not known:
+        return False
+    try:
+        return text_fingerprint(doc_export_text(cfg, doc_id)) == known
+    except DriveError:
+        return False
+
+
+def docs_content_matches(cfg, rel, local_path, doc_id):
+    """Do the note and the Doc already say the same thing, ignoring the cosmetic
+    drift Google adds? Used to establish a baseline and to recognise our own
+    writes echoing back."""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="vaultsync-cmp-")
+    try:
+        probe = os.path.join(tmp, "doc.md")
+        drive_export_doc(cfg, doc_id, probe)
+        with open(probe, encoding="utf-8", errors="replace") as f:
+            remote_text = f.read()
+        with open(local_path, encoding="utf-8", errors="replace") as f:
+            local_text = f.read()
+        return normalize_export(remote_text) == normalize_export(local_text)
+    except DriveError:
+        return False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def parse_rfc3339(value):
+    if not value:
+        return None
+    txt = re.sub(r"\.\d+", "", str(value)).replace("Z", "+0000")
+    txt = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", txt)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(txt, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------- docs sync
+
+
+def sync_docs(cfg, name, pair, dry_run=False, quiet=False):
+    local_root = pair["local"]
+    if not os.path.isdir(local_root):
+        msg = ("local folder is missing: %s — refusing to sync (this would "
+               "delete the Google Docs)" % local_root)
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    started = time.time()
+    state = read_docs_state(name)
+
+    try:
+        remote, strays, remote_plain, folders = scan_remote_docs(cfg, pair)
+    except DriveError as exc:
+        log_event(name, "ERROR %s" % exc)
+        if not quiet:
+            print(color("error: ", RED) + str(exc), file=sys.stderr)
+        return 1, str(exc)
+
+    walk_errors = []
+    local = scan_local_md(local_root, errors=walk_errors)
+    log_event(name, "SCAN local=%d docs=%d strays=%d files=%d"
+              % (len(local), len(remote), len(strays), len(remote_plain)))
+
+    # Guard 0: we could not fully read the local folder. Never conclude from an
+    # unreadable folder that notes were deleted.
+    if walk_errors:
+        msg = ("cannot read the local folder: %s — refusing to sync, because an "
+               "unreadable folder is indistinguishable from an emptied one. If "
+               "this is the background daemon, macOS privacy protection is "
+               "blocking it; `vaultsync start` reports which interpreter it uses."
+               % walk_errors[0])
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+    acts = {"created": [], "pushed": [], "pulled": [], "adopted": [],
+            "doc_deleted": [], "local_deleted": [], "conflicts": [],
+            "kept_both": [], "failed": [], "converted": [],
+            "file_created": [], "file_pushed": [], "file_pulled": [],
+            "file_removed_remote": [], "file_removed_local": []}
+
+    tracked = set(k for k in state if not k.startswith("file:"))
+
+    # Guard 0b: the folder read as completely empty while we track notes in it.
+    # This is what a sandboxed or unreadable folder looks like, and acting on it
+    # would trash every Doc.
+    if state and not local and not scan_local_md(local_root, want_md=False):
+        msg = ("local folder %s read as empty while %d note(s) are tracked — "
+               "refusing to sync. If you really did empty it, re-baseline with: "
+               "vaultsync resync %s" % (local_root, len(tracked), name))
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+
+    # Guard 1: most of what we track has vanished from both sides. Symptom of a
+    # half-mounted folder or a bad listing, not of intent.
+    gone = [r for r in tracked if r not in local and r not in remote]
+    if tracked and len(gone) > max(1, len(tracked) * 0.25):
+        msg = ("%d of %d tracked notes vanished from both sides — refusing to "
+               "sync. Inspect with: vaultsync check %s"
+               % (len(gone), len(tracked), name))
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+
+    # Guard 2: the Docs we know about are missing from Drive's listing while the
+    # notes are still here. Deleting the notes would be the wrong conclusion —
+    # Drive listings can come back incomplete while it is catching up.
+    doc_missing = [r for r in tracked
+                   if state[r].get("doc_id") and r not in remote and r in local]
+    if len(doc_missing) > max(1, len(tracked) * 0.25):
+        msg = ("%d of %d Docs are missing from Drive while their notes are still "
+               "here — refusing to delete notes on that basis. Re-run shortly; "
+               "if it persists, re-baseline with: vaultsync resync %s"
+               % (len(doc_missing), len(tracked), name))
+        log_event(name, "ABORT " + msg)
+        if not quiet:
+            print(color("error: ", RED) + msg, file=sys.stderr)
+        return 2, msg
+
+    # A plain .md sitting in Drive should be a Doc in this mode. Retire it and
+    # let the note below re-create it properly.
+    # Retire every one of them, including where a Doc already exists for the
+    # same note: that duplicate is precisely what must not be left behind.
+    for rel, stray in sorted(strays.items()):
+        if not dry_run:
+            try:
+                archive_remote_file(cfg, name, stamp, rel, stray["id"])
+                log_event(name, "TRASH plain .md %s (a Doc represents it in this "
+                          "mode)" % rel)
+                drive_trash(cfg, stray["id"])
+            except DriveError as exc:
+                acts["failed"].append("%s (retire plain .md: %s)" % (rel, exc))
+                continue
+        acts["converted"].append(rel)
+
+    for rel in sorted(set(local) | set(remote)):
+        l, r = local.get(rel), remote.get(rel)
+        s = state.get(rel, {})
+        entry = dict(s)
+
+        try:
+            if l and not r:
+                if s.get("doc_id"):
+                    if not dry_run:
+                        archive_local(name, stamp, local_root, rel)
+                        os.unlink(l["path"])
+                    acts["local_deleted"].append(rel)
+                    state.pop(rel, None)
+                    continue
+                if not dry_run:
+                    parent = ensure_remote_dir(cfg, folders, rel)
+                    doc = drive_create_doc(
+                        cfg, parent, re.sub(r"\.md$", "", os.path.basename(rel)),
+                        l["path"])
+                    entry["doc_id"] = doc["id"]
+                acts["created"].append(rel)
+                entry["local_hash"] = l["hash"]
+                entry["doc_mtime"] = None
+                state[rel] = entry
+                continue
+
+            if r and not l:
+                if s.get("local_hash"):
+                    if not dry_run:
+                        archive_doc(cfg, name, stamp, rel, r["id"])
+                        log_event(name, "TRASH Doc %s (its note is gone locally)"
+                                  % rel)
+                        drive_trash(cfg, r["id"])
+                    acts["doc_deleted"].append(rel)
+                    state.pop(rel, None)
+                    continue
+                dest = os.path.join(local_root, rel)
+                if not dry_run:
+                    drive_export_doc(cfg, r["id"], dest)
+                    entry["local_hash"] = file_sha(dest)
+                (acts["adopted"] if r["legacy_name"]
+                 else acts["pulled"]).append(rel)
+                entry.update({"doc_id": r["id"], "doc_mtime": r["mtime"],
+                              "shared": r["shared"]})
+                state[rel] = entry
+                continue
+
+            entry.update({"doc_id": r["id"], "shared": r["shared"]})
+
+            # Adopt a web-UI Doc by giving it the conventional name, so it is
+            # never mistaken for a second Doc later.
+            if r["legacy_name"] and not dry_run:
+                try:
+                    drive_rename(cfg, r["id"],
+                                 re.sub(r"\.md$", "", os.path.basename(rel)))
+                except DriveError:
+                    pass
+
+            if not s:
+                # No history to reason from: the one place comparing content is
+                # legitimate. If both already agree, just record the baseline.
+                try:
+                    exported = doc_export_text(cfg, r["id"])
+                except DriveError as exc:
+                    acts["failed"].append("%s (export: %s)" % (rel, exc))
+                    continue
+                with open(l["path"], encoding="utf-8", errors="replace") as fh:
+                    local_text = fh.read()
+                if normalize_export(exported) == normalize_export(local_text):
+                    entry.update({"local_hash": l["hash"],
+                                  "doc_mtime": r["mtime"],
+                                  "doc_export_hash": text_fingerprint(exported)})
+                    state[rel] = entry
+                    continue
+                local_changed = remote_changed = True
+            else:
+                local_changed = l["hash"] != s.get("local_hash")
+                remote_changed = r["mtime"] != s.get("doc_mtime")
+
+            if not local_changed and not remote_changed:
+                if not entry.get("doc_export_hash"):
+                    try:
+                        entry["doc_export_hash"] = text_fingerprint(
+                            doc_export_text(cfg, r["id"]))
+                    except DriveError:
+                        pass
+                state[rel] = entry
+                continue
+
+            if local_changed and not remote_changed:
+                if not dry_run:
+                    archive_doc(cfg, name, stamp, rel, r["id"])
+                    drive_update_doc(cfg, r["id"], l["path"])
+                acts["pushed"].append(rel)
+                entry["local_hash"] = l["hash"]
+                entry["doc_mtime"] = None
+                state[rel] = entry
+                continue
+
+            if remote_changed and not local_changed:
+                # Drive bumps a Doc's modified time when we write it, so a newer
+                # timestamp alone does not prove someone else touched it.
+                if doc_is_echo(cfg, entry, r["id"]):
+                    entry["doc_mtime"] = r["mtime"]
+                    state[rel] = entry
+                    continue
+                if not entry.get("doc_export_hash"):
+                    # No settled render on record, and the note has not changed,
+                    # so this is Drive finishing our own write. Adopt it rather
+                    # than rewriting the note from a lossy export.
+                    try:
+                        entry["doc_export_hash"] = text_fingerprint(
+                            doc_export_text(cfg, r["id"]))
+                        entry["doc_mtime"] = r["mtime"]
+                        state[rel] = entry
+                        log_event(name, "BASELINE adopted settled Doc render for "
+                                  "%s" % rel)
+                        continue
+                    except DriveError:
+                        pass
+                if not dry_run:
+                    archive_local(name, stamp, local_root, rel)
+                    drive_export_doc(cfg, r["id"], l["path"])
+                    entry["local_hash"] = file_sha(l["path"])
+                    with open(l["path"], encoding="utf-8", errors="replace") as fh:
+                        entry["doc_export_hash"] = text_fingerprint(fh.read())
+                acts["pulled"].append(rel)
+                entry["doc_mtime"] = r["mtime"]
+                state[rel] = entry
+                continue
+
+            # Both sides moved. If the Doc only echoes our own last write, the
+            # local edit is the only real change: push it.
+            if doc_is_echo(cfg, entry, r["id"]):
+                if not dry_run:
+                    archive_doc(cfg, name, stamp, rel, r["id"])
+                    drive_update_doc(cfg, r["id"], l["path"])
+                acts["pushed"].append(rel)
+                entry["local_hash"] = l["hash"]
+                entry["doc_mtime"] = None
+                state[rel] = entry
+                continue
+
+            acts["conflicts"].append(rel)
+            if r["shared"] or pair.get("always_keep_both"):
+                # Someone else can edit this Doc, so neither version is safely
+                # discardable. Keep both and let the user merge.
+                side = os.path.join(
+                    local_root,
+                    re.sub(r"\.md$", "", rel) + KEEPBOTH_MARK + stamp + ".md")
+                if not dry_run:
+                    drive_export_doc(cfg, r["id"], side)
+                acts["kept_both"].append(os.path.relpath(side, local_root))
+                entry.update({"local_hash": l["hash"], "doc_mtime": r["mtime"]})
+                state[rel] = entry
+                continue
+
+            doc_time = parse_rfc3339(r["mtime"])
+            if doc_time is not None and doc_time > l["mtime"]:
+                if not dry_run:
+                    archive_local(name, stamp, local_root, rel)
+                    drive_export_doc(cfg, r["id"], l["path"])
+                    entry["local_hash"] = file_sha(l["path"])
+                    with open(l["path"], encoding="utf-8", errors="replace") as fh:
+                        entry["doc_export_hash"] = text_fingerprint(fh.read())
+                acts["pulled"].append(rel)
+                entry["doc_mtime"] = r["mtime"]
+            else:
+                if not dry_run:
+                    archive_doc(cfg, name, stamp, rel, r["id"])
+                    drive_update_doc(cfg, r["id"], l["path"])
+                acts["pushed"].append(rel)
+                entry["local_hash"] = l["hash"]
+                entry["doc_mtime"] = None
+            state[rel] = entry
+
+        except DriveError as exc:
+            acts["failed"].append("%s (%s)" % (rel, exc))
+
+    sync_plain_files(cfg, name, pair, state, remote_plain, folders, acts, stamp,
+                     dry_run)
+
+    # Record the settled modified time for anything we wrote, so the next run
+    # does not read our own write as someone else's edit.
+    if not dry_run and (acts["pushed"] or acts["created"]):
+        try:
+            fresh, _, _, _ = scan_remote_docs(cfg, pair)
+            for rel in acts["pushed"] + acts["created"]:
+                if rel in fresh and rel in state:
+                    state[rel]["doc_id"] = fresh[rel]["id"]
+                    state[rel]["doc_mtime"] = fresh[rel]["mtime"]
+                    state[rel]["shared"] = fresh[rel]["shared"]
+                    # Deliberately leave doc_export_hash unset. Drive's markdown
+                    # render is not stable immediately after an upload, so a hash
+                    # taken now would differ from later reads and look like an
+                    # edit. The next quiet cycle adopts the settled render.
+                    state[rel].pop("doc_export_hash", None)
+        except DriveError as exc:
+            log_event(name, "WARN could not re-read Doc times: %s" % exc)
+
+    if not dry_run:
+        write_docs_state(name, state)
+        prune_empty_history(name, stamp)
+
+    elapsed = time.time() - started
+    code = 1 if acts["failed"] else 0
+    summary = docs_summary(acts)
+    log_event(name, "DOCS %s in %.1fs%s" % (summary or "no changes", elapsed,
+                                            " (dry-run)" if dry_run else ""))
+
+    run_state = read_state(name)
+    run_state.update({
+        "last_run": datetime.now().isoformat(timespec="seconds"),
+        "last_code": code, "last_seconds": round(elapsed, 1),
+        "last_kind": "docs", "last_conflicts": acts["conflicts"],
+        "last_dry_run": bool(dry_run), "baselined": True,
+    })
+    if code == 0:
+        run_state["last_success"] = run_state["last_run"]
+    else:
+        run_state["last_error"] = "; ".join(acts["failed"][:5])
+    if not dry_run:
+        write_state(name, run_state)
+
+    if not quiet:
+        report_docs(name, acts, elapsed, dry_run)
+    return code, summary
+
+
+def sync_plain_files(cfg, name, pair, state, remote_plain, folders, acts, stamp,
+                     dry_run):
+    """Carry non-markdown files through unchanged, so a docs-mode folder is a
+    complete mirror. Newest wins; the loser is archived. Binary files have
+    stable bytes, so there is no drift to work around."""
+    local_root = pair["local"]
+    local = scan_local_md(local_root, want_md=False)
+
+    for rel in sorted(set(local) | set(remote_plain)):
+        l, r = local.get(rel), remote_plain.get(rel)
+        skey = "file:" + rel
+        s = state.get(skey, {})
+        entry = dict(s)
+        try:
+            if l and not r:
+                if s.get("local_hash"):
+                    if not dry_run:
+                        archive_local(name, stamp, local_root, rel)
+                        os.unlink(l["path"])
+                    acts["file_removed_local"].append(rel)
+                    state.pop(skey, None)
+                    continue
+                if not dry_run:
+                    parent = ensure_remote_dir(cfg, folders, rel)
+                    drive_create_file(cfg, parent, os.path.basename(rel), l["path"])
+                acts["file_created"].append(rel)
+                state[skey] = {"local_hash": l["hash"], "remote_mtime": None}
+                continue
+
+            if r and not l:
+                if s.get("local_hash"):
+                    if not dry_run:
+                        archive_remote_file(cfg, name, stamp, rel, r["id"])
+                        log_event(name, "TRASH file %s (gone locally)" % rel)
+                        drive_trash(cfg, r["id"])
+                    acts["file_removed_remote"].append(rel)
+                    state.pop(skey, None)
+                    continue
+                dest = os.path.join(local_root, rel)
+                if not dry_run:
+                    drive_download(cfg, r["id"], dest)
+                    entry["local_hash"] = file_sha(dest)
+                acts["file_pulled"].append(rel)
+                entry["remote_mtime"] = r["mtime"]
+                state[skey] = entry
+                continue
+
+            if not s:
+                # Baseline: Drive gives us an md5 for ordinary files, so we can
+                # tell they already match without moving any bytes.
+                if r.get("md5") and r["md5"] == file_md5(l["path"]):
+                    state[skey] = {"local_hash": l["hash"],
+                                   "remote_mtime": r["mtime"]}
+                    continue
+                local_changed = remote_changed = True
+            else:
+                local_changed = l["hash"] != s.get("local_hash")
+                remote_changed = r["mtime"] != s.get("remote_mtime")
+
+            if not local_changed and not remote_changed:
+                state[skey] = entry
+                continue
+            if r.get("md5") and r["md5"] == file_md5(l["path"]):
+                state[skey] = {"local_hash": l["hash"], "remote_mtime": r["mtime"]}
+                continue
+
+            remote_time = parse_rfc3339(r["mtime"])
+            prefer_remote = (remote_changed and not local_changed) or (
+                local_changed and remote_changed
+                and remote_time is not None and remote_time > l["mtime"])
+
+            if prefer_remote:
+                if not dry_run:
+                    archive_local(name, stamp, local_root, rel)
+                    drive_download(cfg, r["id"], l["path"])
+                    entry["local_hash"] = file_sha(l["path"])
+                acts["file_pulled"].append(rel)
+                entry["remote_mtime"] = r["mtime"]
+            else:
+                if not dry_run:
+                    archive_remote_file(cfg, name, stamp, rel, r["id"])
+                    drive_update_file(cfg, r["id"], l["path"])
+                acts["file_pushed"].append(rel)
+                entry["local_hash"] = l["hash"]
+                entry["remote_mtime"] = None
+            state[skey] = entry
+        except DriveError as exc:
+            acts["failed"].append("%s (%s)" % (rel, exc))
+
+    if not dry_run and (acts["file_created"] or acts["file_pushed"]):
+        try:
+            _, _, fresh, _ = scan_remote_docs(cfg, pair)
+            for rel, meta in fresh.items():
+                skey = "file:" + rel
+                if skey in state and state[skey].get("remote_mtime") is None:
+                    state[skey]["remote_mtime"] = meta["mtime"]
+        except DriveError:
+            pass
+
+
+def docs_summary(acts):
+    bits = []
+    for key, label in (("created", "Docs created"), ("pushed", "Docs updated"),
+                       ("pulled", "notes pulled"), ("adopted", "Docs adopted"),
+                       ("converted", "plain .md retired"),
+                       ("doc_deleted", "Docs removed"),
+                       ("local_deleted", "notes removed"),
+                       ("file_created", "files uploaded"),
+                       ("file_pushed", "files updated"),
+                       ("file_pulled", "files downloaded"),
+                       ("file_removed_remote", "files removed in Drive"),
+                       ("file_removed_local", "files removed locally"),
+                       ("kept_both", "kept both"), ("failed", "failed")):
+        if acts.get(key):
+            bits.append("%d %s" % (len(acts[key]), label))
+    return ", ".join(bits)
+
+
+def report_docs(name, acts, elapsed, dry_run):
+    summary = docs_summary(acts)
+    head = "would sync" if dry_run else "synced"
+    if acts["failed"]:
+        print(color("failed  ", RED) + "'%s' — %s" % (name, summary),
+              file=sys.stderr)
+        for item in acts["failed"][:5]:
+            print("  " + item, file=sys.stderr)
+    else:
+        info(color("ok  ", GREEN) + "%s '%s' in %.1fs%s"
+             % (head, name, elapsed,
+                " — " + summary if summary else " — no changes"))
+    for key, label in (("created", "new Google Doc"),
+                       ("pulled", "updated from the Doc"),
+                       ("pushed", "pushed to the Doc"),
+                       ("adopted", "adopted existing Doc"),
+                       ("converted", "plain .md retired"),
+                       ("doc_deleted", "Doc moved to Drive trash"),
+                       ("local_deleted", "note deleted locally"),
+                       ("file_created", "uploaded"),
+                       ("file_pushed", "uploaded (changed)"),
+                       ("file_pulled", "downloaded"),
+                       ("file_removed_remote", "removed in Drive"),
+                       ("file_removed_local", "removed locally")):
+        for rel in acts.get(key, [])[:10]:
+            info("    %-24s %s" % (label, rel))
+    if acts["kept_both"]:
+        info(color("  %d shared Doc(s) changed on both sides — both versions "
+                   "kept:" % len(acts["kept_both"]), YELLOW))
+        for rel in acts["kept_both"]:
+            info("    " + rel)
+        info(DIM + "  Merge by hand, then delete the extra file." + RESET)
+
+
+# ---------------------------------------------------------------- daemon
+
+
+def start_watcher(cfg, pair):
+    binary = find_binary(cfg, "fswatch", "fswatch")
+    if not binary:
+        return None
+    try:
+        return subprocess.Popen(
+            [binary, "-0", "-r", "--event", "Created", "--event", "Updated",
+             "--event", "Removed", "--event", "Renamed",
+             "--exclude", r"\.DS_Store", "--exclude", r"\.vsconflict",
+             pair["local"]],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0,
+        )
+    except OSError:
+        return None
+
+
+def wait_for_change(watcher, sel, timeout, debounce):
+    """Block until the folder changes or `timeout` elapses. True if it changed."""
+    if watcher is None or watcher.poll() is not None:
+        time.sleep(timeout)
+        return False
+    if not sel.select(timeout):
+        return False
+    fd = watcher.stdout.fileno()
+    try:
+        os.read(fd, 1 << 16)
+    except OSError:
+        return True
+    # Coalesce a burst of saves into one sync.
+    deadline = time.time() + debounce
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        if sel.select(remaining):
+            try:
+                os.read(fd, 1 << 16)
+            except OSError:
+                break
+            deadline = time.time() + debounce
+    return True
+
+
+def cmd_daemon(cfg, args):
+    if not args:
+        die("usage: vaultsync daemon <pair>")
+    name, pair = get_pair(cfg, args[0])
+    interval = int(pair.get("interval", 120))
+    debounce = int(pair.get("debounce", 6))
+
+    # Exit only between syncs. Killing rclone mid-run strands a lock file that
+    # blocks every later sync.
+    stopping = {"now": False}
+
+    def request_stop(signum, frame):
+        stopping["now"] = True
+        log_event(name, "DAEMON stop requested (signal %d) — finishing current "
+                  "sync first" % signum)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    log_event(name, "DAEMON start pid=%d interval=%ds" % (os.getpid(), interval))
+    watcher = start_watcher(cfg, pair)
+    if watcher is None:
+        log_event(name, "WARN fswatch unavailable — polling every %ds only" % interval)
+    sel = selectors.DefaultSelector()
+    if watcher is not None:
+        sel.register(watcher.stdout, selectors.EVENT_READ)
+
+    backoff = 0
+    try:
+        while not stopping["now"]:
+            try:
+                with Lock(name, wait=90):
+                    code, _ = sync_once(cfg, name, pair, quiet=True)
+                backoff = min(backoff * 2, 900) if code != 0 else 0
+            except RuntimeError as exc:
+                log_event(name, "SKIP %s" % exc)
+            except Exception as exc:  # keep the daemon alive
+                log_event(name, "ERROR %r" % (exc,))
+                backoff = min(max(backoff * 2, 60), 900)
+
+            if stopping["now"]:
+                break
+            if backoff:
+                log_event(name, "BACKOFF sleeping %ds after failure" % backoff)
+                time.sleep(backoff)
+
+            if watcher is not None and watcher.poll() is not None:
+                sel.unregister(watcher.stdout)
+                watcher = start_watcher(cfg, pair)
+                if watcher is not None:
+                    sel.register(watcher.stdout, selectors.EVENT_READ)
+
+            wait_for_change(watcher, sel, interval, debounce)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log_event(name, "DAEMON stop pid=%d" % os.getpid())
+        if watcher is not None:
+            watcher.terminate()
+
+
+# ---------------------------------------------------------------- launchd
+
+
+def label_for(name):
+    return "%s.%s" % (LABEL_PREFIX, name)
+
+
+def plist_path(name):
+    return os.path.join(AGENTS_DIR, label_for(name) + ".plist")
+
+
+def launchctl(*argv):
+    proc = subprocess.run(["launchctl"] + list(argv), stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, universal_newlines=True)
+    return proc.returncode, proc.stdout or ""
+
+
+def install_agent(cfg, name, pair):
+    os.makedirs(AGENTS_DIR, exist_ok=True)
+    self_path = os.path.abspath(__file__)
+    interpreter, trusted = daemon_python(cfg)
+    if not trusted:
+        info(color("  warning: ", YELLOW) + "only Apple's python3 is available, "
+             "which macOS blocks from reading ~/Documents in the background.")
+        info(DIM + "  Install a permitted one:  brew install python@3.13" + RESET)
+    plist = {
+        "Label": label_for(name),
+        "ProgramArguments": [interpreter, self_path, "daemon", name],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 30,
+        # Give an in-flight sync time to finish before launchd escalates to
+        # SIGKILL, which would strand a bisync lock file.
+        "ExitTimeOut": 300,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "StandardOutPath": os.path.join(LOGS_DIR, name + ".daemon.log"),
+        "StandardErrorPath": os.path.join(LOGS_DIR, name + ".daemon.log"),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": HOME,
+        },
+    }
+    with open(plist_path(name), "wb") as f:
+        plistlib.dump(plist, f)
+
+    domain = "gui/%d" % os.getuid()
+    launchctl("bootout", "%s/%s" % (domain, label_for(name)))
+    code, out = launchctl("bootstrap", domain, plist_path(name))
+    if code != 0:
+        code, out = launchctl("load", "-w", plist_path(name))
+    return code, out
+
+
+def remove_agent(name):
+    domain = "gui/%d" % os.getuid()
+    launchctl("bootout", "%s/%s" % (domain, label_for(name)))
+    if os.path.exists(plist_path(name)):
+        launchctl("unload", "-w", plist_path(name))
+        os.unlink(plist_path(name))
+
+
+def agent_running(name):
+    code, out = launchctl("list", label_for(name))
+    if code != 0:
+        return False, None
+    m = re.search(r'"PID"\s*=\s*(\d+)', out)
+    return True, int(m.group(1)) if m else None
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_setup(cfg, args):
+    """Walk a new install through to a working sync."""
+    info(color("vaultsync %s — setup" % __version__, BOLD))
+    info("")
+
+    missing = []
+    if not find_binary(cfg, "rclone", "rclone"):
+        missing.append("rclone")
+    if not find_binary(cfg, "fswatch", "fswatch"):
+        missing.append("fswatch")
+    _, trusted = daemon_python(cfg)
+    if not trusted:
+        missing.append("python@3.13")
+    if missing:
+        info(color("1. Install what's missing", BOLD))
+        info("     brew install %s" % " ".join(missing))
+        info("")
+        info(DIM + "   Then run `vaultsync setup` again." + RESET)
+        return 1
+    info(color("1. Tools", BOLD) + "  rclone, fswatch and a background-safe "
+         "Python are all present.")
+    info("")
+
+    # Google Drive
+    remote = cfg.get("remote", "gdrive")
+    _, lines, _ = rclone_lines(cfg, ["listremotes"])
+    remotes = [r.rstrip(":") for r in lines]
+    info(color("2. Google Drive", BOLD))
+    if remote not in remotes:
+        info("   Not connected yet. This opens a browser once:")
+        info("")
+        info("     rclone config create %s drive scope drive \\" % remote)
+        info("       client_id YOUR_CLIENT_ID client_secret YOUR_CLIENT_SECRET")
+        info("")
+        info("   You need your own Google API client — about two minutes, and it")
+        info("   keeps your data going only between you and Google:")
+        info("     %s" % DOCS_OAUTH_URL)
+        info("")
+        info(DIM + "   Then run `vaultsync setup` again." + RESET)
+        return 1
+    code, about, err = rclone_lines(cfg, ["about", remote + ":"])
+    if code != 0:
+        info(color("   Connected but not responding:", YELLOW))
+        info(indent(summarize_error(err), "     "))
+        info(DIM + "   Re-authorise with:  rclone config reconnect %s:" % remote
+             + RESET)
+        return 1
+    info("   Connected.  %s" % "; ".join(about[:2]))
+    try:
+        drive_token(cfg)
+        info("   Google Docs mode is available on this account.")
+    except DriveError as exc:
+        info(color("   Google Docs mode not available: ", YELLOW) + str(exc))
+        info("   Plain file sync still works. To enable Docs mode, add your own")
+        info("   API client: %s" % DOCS_OAUTH_URL)
+    info("")
+
+    # Vault
+    info(color("3. Your vault", BOLD))
+    root = cfg.get("vault_root") or ""
+    if not root:
+        vaults = detect_vaults()
+        if len(vaults) == 1:
+            cfg["vault_root"] = vaults[0]
+            save_config(cfg)
+            root = vaults[0]
+            info("   Found one vault, using it: %s" % root)
+        elif vaults:
+            info("   Several vaults found. Pick your default:")
+            for v in vaults[:8]:
+                info("     vaultsync vault %s" % v)
+            info("")
+            info(DIM + "   Or skip this and pass full paths to `vaultsync add`."
+                 + RESET)
+        else:
+            info("   No Obsidian vault found. You can still sync any folder by")
+            info("   passing its full path to `vaultsync add`.")
+    else:
+        info("   %s" % root)
+    info("")
+
+    info(color("4. Mirror a folder", BOLD))
+    info('     vaultsync add "<folder>" --mode docs      as Google Docs')
+    info('     vaultsync add "<folder>"                  as plain files')
+    info("")
+    info(DIM + "   `vaultsync doctor` checks everything, including whether macOS "
+         "will\n   let the background agent read your vault." + RESET)
+    return 0
+
+
+def cmd_add(cfg, args):
+    if not args:
+        die('usage: vaultsync add "<Folder name or path>" [--remote PATH] '
+            '[--interval SECONDS] [--no-start]')
+    target = args[0]
+    opts = parse_opts(args[1:],
+                      {"remote": str, "interval": int, "name": str, "mode": str},
+                      flags={"no-start", "no-sync"})
+    mode = opts.get("mode", "files")
+    if mode not in ("files", "docs"):
+        die("--mode must be 'files' (plain markdown) or 'docs' (Google Docs)")
+
+    if os.path.isabs(target):
+        local = target
+    else:
+        root = resolve_vault_root(cfg)
+        if not root:
+            die("could not tell which vault you mean. Either pass a full path, "
+                "or set a default with:  vaultsync vault <path-to-vault>")
+        local = os.path.join(root, target)
+    local = os.path.realpath(local)
+    if not os.path.isdir(local):
+        die("not a folder: %s" % local)
+
+    for other, p in cfg["pairs"].items():
+        op = os.path.realpath(p["local"])
+        if op == local:
+            die("'%s' already mirrors that folder" % other)
+        if local.startswith(op + os.sep) or op.startswith(local + os.sep):
+            die("overlaps existing pair '%s' (%s) — nested mirrors would fight"
+                % (other, op))
+
+    folder = os.path.basename(local)
+    name = opts.get("name") or slug(folder)
+    if name in cfg["pairs"]:
+        die("a pair named '%s' already exists" % name)
+
+    remote = opts.get("remote") or "%s:%s/%s" % (cfg["remote"], cfg["remote_base"], folder)
+    if ":" not in remote:
+        remote = "%s:%s" % (cfg["remote"], remote.lstrip("/"))
+
+    pair = {
+        "local": local,
+        "remote": remote,
+        "mode": mode,
+        "interval": opts.get("interval", 120),
+        "debounce": 6,
+        "max_delete": 25,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }
+    cfg["pairs"][name] = pair
+    save_config(cfg)
+
+    info(color("added ", GREEN) + "'%s'" % name)
+    info("  local:   %s" % local)
+    info("  Drive:   %s" % remote)
+    info("  mode:    %s" % ("native Google Docs" if mode == "docs"
+                            else "plain files"))
+    info("  poll:    every %ds (plus instant on local change)" % pair["interval"])
+
+    code, _ = run_rclone(cfg, ["mkdir", remote])
+    if code != 0:
+        info(color("  warning: ", YELLOW) + "could not create the Drive folder — "
+             "run `vaultsync setup` to check authorization")
+
+    if not opts.get("no-sync"):
+        info("")
+        with Lock(name, wait=30):
+            sync_once(cfg, name, pair)
+    if not opts.get("no-start"):
+        cmd_start(cfg, [name])
+    return 0
+
+
+def cmd_vault(cfg, args):
+    """Show or set the vault that folder names are resolved against."""
+    positional = [a for a in args if not a.startswith("-")]
+    if positional:
+        path = os.path.realpath(os.path.expanduser(positional[0]))
+        if not os.path.isdir(path):
+            die("not a folder: %s" % path)
+        if not os.path.isdir(os.path.join(path, ".obsidian")):
+            info(color("note: ", YELLOW) + "%s has no .obsidian folder, so it may "
+                 "not be a vault. Using it anyway." % path)
+        cfg["vault_root"] = path
+        save_config(cfg)
+        info(color("default vault set ", GREEN) + path)
+        return 0
+    current = cfg.get("vault_root") or ""
+    info("Default vault: %s" % (current or "not set"))
+    found = detect_vaults()
+    if found:
+        info("")
+        info("Vaults found on this machine:")
+        for v in found[:10]:
+            info("%s%s" % ("  * " if v == current else "    ", v))
+        info("")
+        info(DIM + "Set one with:  vaultsync vault <path>" + RESET)
+    return 0
+
+
+def cmd_version(cfg, args):
+    info("vaultsync %s" % __version__)
+    return 0
+
+
+def cmd_list(cfg, args):
+    pairs = cfg["pairs"]
+    if not pairs:
+        info("No folders mirrored yet.  Add one:  " +
+             color('vaultsync add "<folder>"', BOLD))
+        return 0
+    for name in sorted(pairs):
+        pair = pairs[name]
+        running, pid = agent_running(name)
+        state = read_state(name)
+        dot = color("●", GREEN) if running else color("○", DIM)
+        status = "syncing" if running else "stopped"
+        if pair.get("mode") == "docs":
+            status += "  (Google Docs)"
+        info("%s %s %s" % (dot, color(name.ljust(18), BOLD), status))
+        info("    %s" % pair["local"])
+        info("    → %s" % pair["remote"])
+        last = state.get("last_run")
+        if last:
+            verdict = "ok" if state.get("last_code") == 0 else color("failed", RED)
+            info("    %slast run %s (%s)%s" % (DIM, last, verdict, RESET))
+    return 0
+
+
+def cmd_status(cfg, args):
+    if not cfg["pairs"]:
+        return cmd_list(cfg, args)
+    names = [args[0]] if args else sorted(cfg["pairs"])
+    for raw in names:
+        name, pair = get_pair(cfg, raw)
+        state = read_state(name)
+        running, pid = agent_running(name)
+        info(color(name, BOLD))
+        info("  local        %s" % pair["local"])
+        info("  Drive        %s" % pair["remote"])
+        info("  mode         %s" % ("native Google Docs"
+                                   if pair.get("mode") == "docs"
+                                   else "plain files"))
+        info("  daemon       %s" % ("running (pid %s)" % pid if running
+                                    else color("not running", YELLOW)))
+        info("  poll         every %ss" % pair.get("interval", 120))
+        info("  baseline     %s" % ("established" if state.get("baselined")
+                                    else color("not yet synced", YELLOW)))
+        info("  last run     %s" % (state.get("last_run") or "—"))
+        info("  last result  %s" % ("ok" if state.get("last_code") == 0
+                                    else color("exit %s" % state.get("last_code"), RED)
+                                    if state.get("last_code") is not None else "—"))
+        if state.get("last_conflicts"):
+            info("  conflicts    %d in last run (archived)"
+                 % len(state["last_conflicts"]))
+        if state.get("last_code") not in (0, None):
+            info(indent(state.get("last_error", ""), "               "))
+        runs = history_runs(name)
+        info("  history      %d archived run(s)%s"
+             % (len(runs), ", newest %s" % runs[-1] if runs else ""))
+    return 0
+
+
+def cmd_now(cfg, args):
+    names, opts = split_args(args, {}, {"dry-run": "dry", "n": "dry"})
+    dry = bool(opts.get("dry"))
+    targets = names or sorted(cfg["pairs"])
+    if not targets:
+        die("no folders configured. Add one with:  vaultsync add \"<Folder>\"")
+    worst = 0
+    for raw in targets:
+        name, pair = get_pair(cfg, raw)
+        try:
+            with Lock(name, wait=120):
+                code, _ = sync_once(cfg, name, pair, dry_run=dry)
+        except RuntimeError as exc:
+            print(color("skipped ", YELLOW) + "%s: %s" % (name, exc), file=sys.stderr)
+            code = 1
+        worst = max(worst, code)
+    return worst
+
+
+def cmd_check(cfg, args):
+    name, pair = resolve_pair_arg(cfg, args)
+    info("Dry run — no files will be changed.")
+    with Lock(name, wait=120):
+        code, _ = sync_once(cfg, name, pair, dry_run=True)
+    return code
+
+
+def cmd_resync(cfg, args):
+    name, pair = resolve_pair_arg(cfg, args)
+    info("Re-establishing the baseline for '%s'." % name)
+    info(DIM + "Files present on both sides are reconciled by timestamp; the "
+         "newer copy wins." + RESET)
+    if sys.stdin.isatty() and "--yes" not in args:
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            return 1
+    with Lock(name, wait=120):
+        code, _ = sync_once(cfg, name, pair, force_resync=True)
+    return code
+
+
+def cmd_start(cfg, args):
+    name, pair = resolve_pair_arg(cfg, args)
+    try:
+        log_mark = os.path.getsize(log_path(name))
+    except OSError:
+        log_mark = 0
+    code, out = install_agent(cfg, name, pair)
+    if code != 0:
+        die("launchctl refused to start the agent:\n%s" % indent(out))
+    time.sleep(1.5)
+    running, pid = agent_running(name)
+    info(color("started ", GREEN) + "background sync for '%s'%s"
+         % (name, " (pid %s)" % pid if pid else ""))
+    info(DIM + "It syncs on every local change and polls Drive every %ss. "
+         "Survives reboots." % pair.get("interval", 120) + RESET)
+
+    # Confirm the agent can actually read the folder. Under macOS privacy
+    # protection a background agent can be denied ~/Documents, and a daemon that
+    # cannot see your notes is worse than no daemon at all.
+    marker = "cannot read the local folder"
+    deadline = time.time() + 75
+    while time.time() < deadline:
+        try:
+            with open(log_path(name)) as f:
+                f.seek(log_mark)   # only what this daemon has written
+                tail = f.read()
+        except OSError:
+            tail = ""
+        if marker in tail:
+            print("", file=sys.stderr)
+            print(color("blocked: ", RED) + "the background agent is not allowed "
+                  "to read %s" % pair["local"], file=sys.stderr)
+            print("  macOS privacy protection is denying it. Grant Full Disk "
+                  "Access to:", file=sys.stderr)
+            print("    %s" % daemon_python(cfg)[0], file=sys.stderr)
+            print("  in System Settings > Privacy & Security > Full Disk Access, "
+                  "then run: vaultsync start %s" % name, file=sys.stderr)
+            print(DIM + "  Syncing is paused meanwhile; nothing is deleted."
+                  + RESET, file=sys.stderr)
+            return 1
+        if "SCAN local=" in tail:
+            info(color("verified ", GREEN) + "the agent can read the folder.")
+            return 0
+        time.sleep(3)
+    info(DIM + "(could not confirm the first background sync yet; check "
+         "`vaultsync logs %s`)" % name + RESET)
+    return 0
+
+
+def cmd_stop(cfg, args):
+    name, _ = resolve_pair_arg(cfg, args)
+    running, _ = agent_running(name)
+    remove_agent(name)
+    if running:
+        # The daemon finishes any in-flight sync before exiting.
+        for _ in range(60):
+            still, _ = agent_running(name)
+            if not still:
+                break
+            time.sleep(1)
+    info(color("stopped ", YELLOW) + "background sync for '%s'" % name)
+    info(DIM + "Manual syncs still work: vaultsync now %s" % name + RESET)
+    return 0
+
+
+def cmd_remove(cfg, args):
+    if not args:
+        die("usage: vaultsync remove <pair> [--delete-drive]")
+    name, pair = get_pair(cfg, args[0])
+    remove_agent(name)
+    del cfg["pairs"][name]
+    save_config(cfg)
+    info(color("removed ", YELLOW) + "'%s' from vaultsync" % name)
+    info("  Local folder kept:  %s" % pair["local"])
+    if "--delete-drive" in args:
+        code, out = run_rclone(cfg, ["purge", pair["remote"]])
+        info("  Drive copy %s" % ("deleted" if code == 0 else "NOT deleted:\n" + indent(out)))
+    else:
+        info("  Drive copy kept:    %s" % pair["remote"])
+    info(DIM + "  Version history kept at %s" % os.path.join(HISTORY_DIR, name) + RESET)
+    return 0
+
+
+def cmd_mode(cfg, args):
+    positional, _ = split_args(args, {}, {"yes": "yes"})
+    if len(positional) < 2:
+        die("usage: vaultsync mode <pair> docs|files")
+    name, pair = get_pair(cfg, positional[0])
+    target = positional[1]
+    if target not in ("files", "docs"):
+        die("mode must be 'docs' or 'files'")
+    current = pair.get("mode", "files")
+    if current == target:
+        info("'%s' is already in %s mode." % (name, target))
+        return 0
+
+    if target == "files":
+        info(color("Switching '%s' back to plain files." % name, YELLOW))
+        info("Any Google Docs in the Drive folder will stop syncing and be "
+             "left untouched.")
+        if sys.stdin.isatty() and "--yes" not in args:
+            if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                return 1
+        pair["mode"] = "files"
+        save_config(cfg)
+        read_state(name) and write_state(name, dict(read_state(name),
+                                                    baselined=False))
+        info("Done. Next sync re-establishes the plain-file baseline.")
+        return 0
+
+    # files -> docs
+    try:
+        remote_docs, strays, remote_plain, _ = scan_remote_docs(cfg, pair)
+    except DriveError as exc:
+        die(str(exc))
+    local = scan_local_md(pair["local"])
+    legacy = {r: d for r, d in remote_docs.items() if d["legacy_name"]}
+    to_create = [r for r in local if r not in remote_docs]
+
+    info(color("Convert '%s' to native Google Docs" % name, BOLD))
+    info("  %d note(s) become Google Docs in %s" % (len(to_create), pair["remote"]))
+    if legacy:
+        info("  %d existing Doc(s) adopted, and renamed to match their note:"
+             % len(legacy))
+        for rel in sorted(legacy):
+            info("      %s  ->  %s" % (legacy[rel]["name"],
+                                       re.sub(r"\.md$", "", os.path.basename(rel))))
+    if strays:
+        info("  %d plain .md file(s) in Drive retired, since the Doc replaces them"
+             % len(strays))
+        info(DIM + "      (your local copies are the source and stay untouched; "
+             "Drive keeps them in its trash)" + RESET)
+    if remote_plain:
+        info("  %d non-markdown file(s) keep syncing as ordinary files"
+             % len(remote_plain))
+    if sys.stdin.isatty() and "--yes" not in args:
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            return 1
+
+    was_running, _ = agent_running(name)
+    if was_running:
+        cmd_stop(cfg, [name])
+
+    # The engine itself adopts legacy Docs and retires stray .md files, all by
+    # file ID, so there is nothing to reorganise by name up front.
+    pair["mode"] = "docs"
+    save_config(cfg)
+    write_docs_state(name, {})
+    info("")
+    with Lock(name, wait=120):
+        code, _ = sync_docs(cfg, name, pair)
+    if was_running:
+        cmd_start(cfg, [name])
+    return code
+
+
+def cmd_adopt(cfg, args):
+    """Retire plain .md files sitting in a docs-mode Drive folder so the matching
+    note is re-created as a Doc."""
+    name, pair = resolve_pair_arg(cfg, args)
+    if pair.get("mode") != "docs":
+        die("'%s' is not in docs mode (see: vaultsync mode %s docs)" % (name, name))
+    with Lock(name, wait=120):
+        code, _ = sync_docs(cfg, name, pair)
+    return code
+
+
+def cmd_uninstall(cfg, args):
+    """Stop everything and remove vaultsync's own files.
+
+    Never touches your vault, your Drive, or your rclone config.
+    """
+    _, opts = split_args(args, {}, {"yes": "yes", "purge": "purge"})
+    pairs = sorted(cfg.get("pairs", {}))
+    info(color("Uninstall vaultsync", BOLD))
+    info("  stop and remove %d background agent(s)" % len(pairs))
+    info("  remove ~/.local/bin/vaultsync")
+    if opts.get("purge"):
+        info("  delete %s, including your version history" % BASE)
+    else:
+        info("  keep %s (config, logs, version history)" % BASE)
+        info(DIM + "     add --purge to delete that too" + RESET)
+    info("")
+    info("  your vault, your Google Drive and your rclone config are untouched")
+    if sys.stdin.isatty() and not opts.get("yes"):
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            return 1
+    for name in pairs:
+        remove_agent(name)
+        info("  stopped %s" % name)
+    target = os.path.join(BIN_DIR, "vaultsync")
+    for candidate in (target, os.path.realpath(__file__)):
+        try:
+            if os.path.exists(candidate) and BASE not in candidate:
+                os.unlink(candidate)
+                info("  removed %s" % candidate)
+                break
+        except OSError as exc:
+            info(color("  could not remove %s: %s" % (candidate, exc), YELLOW))
+    if opts.get("purge"):
+        shutil.rmtree(BASE, ignore_errors=True)
+        info("  deleted %s" % BASE)
+    info("")
+    info(color("Done.", GREEN) + " If you installed with Homebrew, also run:  "
+         "brew uninstall vaultsync")
+    return 0
+
+
+def cmd_logs(cfg, args):
+    positional, opts = split_args(
+        args, {"n": "lines", "lines": "lines"}, {"f": "follow", "follow": "follow"})
+    name, _ = resolve_pair_arg(cfg, positional)
+    n = int(opts.get("lines", 60))
+    follow = bool(opts.get("follow"))
+    path = log_path(name)
+    if not os.path.exists(path):
+        info("no log yet for '%s'" % name)
+        return 0
+    if follow:
+        os.execvp("tail", ["tail", "-n", str(n), "-f", path])
+    with open(path) as f:
+        lines = f.readlines()
+    sys.stdout.write("".join(lines[-n:]))
+    return 0
+
+
+# ---------------------------------------------------------------- history
+
+
+def history_runs(name):
+    root = os.path.join(HISTORY_DIR, name)
+    if not os.path.isdir(root):
+        return []
+    return sorted(d for d in os.listdir(root)
+                  if os.path.isdir(os.path.join(root, d)) and d[0].isdigit())
+
+
+def archived_files(name, stamp):
+    """Yield (relpath_in_archive, absolute_path, restore_relpath)."""
+    root = os.path.join(HISTORY_DIR, name, stamp)
+    for kind in ("local", "conflicts"):
+        base = os.path.join(root, kind)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _, files in os.walk(base):
+            for fn in files:
+                abs_path = os.path.join(dirpath, fn)
+                rel = os.path.relpath(abs_path, base)
+                restore = rel
+                if kind == "conflicts":
+                    restore = re.sub(re.escape(CONFLICT_SUFFIX) + r"\d*", "", rel)
+                yield (os.path.join(kind, rel), abs_path, restore)
+
+
+def cmd_history(cfg, args):
+    positional, opts = split_args(args, {"file": "file", "f": "file"})
+    grep = opts["file"].lower() if opts.get("file") else None
+    name, pair = resolve_pair_arg(cfg, positional)
+    runs = history_runs(name)
+    if not runs:
+        info("No archived versions for '%s' yet." % name)
+        info(DIM + "Versions land here when a sync overwrites or deletes a file."
+             + RESET)
+        return 0
+
+    info(color("Version history for '%s'" % name, BOLD))
+    info(DIM + "  archive: %s" % os.path.join(HISTORY_DIR, name) + RESET)
+    shown = 0
+    for stamp in reversed(runs):
+        entries = [e for e in archived_files(name, stamp)]
+        if grep:
+            entries = [e for e in entries if grep in e[2].lower()]
+        if not entries:
+            continue
+        info("")
+        info("  %s  %s" % (color(stamp, BOLD), DIM + "(%d file%s)"
+                           % (len(entries), "" if len(entries) == 1 else "s") + RESET))
+        for archive_rel, abs_path, restore_rel in entries[:25]:
+            kind = "conflict" if archive_rel.startswith("conflicts") else "replaced"
+            size = os.path.getsize(abs_path)
+            info("    %-9s %s %s" % (kind, restore_rel,
+                                     DIM + "(%s)" % human(size) + RESET))
+        if len(entries) > 25:
+            info("    %s… and %d more" % (DIM, len(entries) - 25) + RESET)
+        shown += 1
+    if not shown:
+        info("  nothing matching %r" % grep)
+        return 0
+    info("")
+    info(DIM + "  restore:  vaultsync restore %s <timestamp> <path>" % name + RESET)
+    return 0
+
+
+def cmd_restore(cfg, args):
+    positional = [a for a in args if not a.startswith("-")]
+    if len(positional) < 3:
+        die("usage: vaultsync restore <pair> <timestamp> <path/in/folder> [--force]")
+    name, pair = get_pair(cfg, positional[0])
+    stamp, wanted = positional[1], positional[2]
+
+    runs = history_runs(name)
+    stamps = [s for s in runs if s == stamp] or [s for s in runs if s.startswith(stamp)]
+    if not stamps:
+        die("no archived run matching '%s' (see: vaultsync history %s)" % (stamp, name))
+    stamp = stamps[-1]
+
+    matches = [e for e in archived_files(name, stamp)
+               if e[2] == wanted or e[2].endswith("/" + wanted)
+               or os.path.basename(e[2]) == wanted]
+    if not matches:
+        die("'%s' is not in run %s (see: vaultsync history %s --file %s)"
+            % (wanted, stamp, name, os.path.basename(wanted)))
+    if len(matches) > 1:
+        info("Several archived files match — name one exactly:")
+        for _, _, restore_rel in matches:
+            info("  " + restore_rel)
+        return 1
+
+    _, src, restore_rel = matches[0]
+    dest = os.path.join(pair["local"], restore_rel)
+    if os.path.exists(dest):
+        if "--force" not in args:
+            info("This will replace the current file at:")
+            info("  %s" % dest)
+            info(DIM + "  (its present contents are archived first, so the swap "
+                 "is reversible)" + RESET)
+            if sys.stdin.isatty():
+                if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                    return 1
+        # Archive what is being replaced, so a restore is itself undoable.
+        stash_stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        stash = os.path.join(history_run_dir(name, stash_stamp), "local", restore_rel)
+        os.makedirs(os.path.dirname(stash), exist_ok=True)
+        shutil.copy2(dest, stash)
+        info(DIM + "  previous contents archived as %s" % stash_stamp + RESET)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.copy2(src, dest)
+    os.utime(dest, None)  # make it newest so it wins the next sync
+    info(color("restored ", GREEN) + restore_rel)
+    info("  from %s → %s" % (stamp, dest))
+    info(DIM + "  Timestamp bumped to now, so the next sync pushes it to Drive."
+         + RESET)
+    log_event(name, "RESTORE %s from %s" % (restore_rel, stamp))
+    return 0
+
+
+def cmd_prune(cfg, args):
+    _, opts = split_args(args, {"days": "days", "d": "days"})
+    days = int(opts.get("days", cfg.get("history_days", 30)))
+    cutoff = datetime.now() - timedelta(days=days)
+    removed = 0
+    for name in sorted(cfg["pairs"]) or os.listdir(HISTORY_DIR):
+        for stamp in history_runs(name):
+            try:
+                when = datetime.strptime(stamp, "%Y-%m-%dT%H-%M-%S")
+            except ValueError:
+                continue
+            if when < cutoff:
+                shutil.rmtree(os.path.join(HISTORY_DIR, name, stamp),
+                              ignore_errors=True)
+                removed += 1
+    info("Pruned %d archived run(s) older than %d days." % (removed, days))
+    if cfg["pairs"]:
+        code, out = run_rclone(cfg, [
+            "delete", "--min-age", "%dd" % days, "--rmdirs",
+            "%s:%s" % (cfg["remote"], cfg["remote_history_base"]),
+        ])
+        if code == 0:
+            info("Pruned the Drive-side archive too.")
+    return 0
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%.0f %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+
+# ---------------------------------------------------------------- diagnostics
+
+
+def probe_background_access(cfg, path, timeout=45):
+    """Can a launchd agent actually read `path`?
+
+    macOS privacy protection can deny a background agent access to ~/Documents
+    while the same code works fine in a terminal. That failure is silent — the
+    folder simply looks empty — so it is worth testing for directly rather than
+    discovering it later.
+
+    Returns True, False, or None if the probe could not be run.
+    """
+    interpreter, _ = daemon_python(cfg)
+    label = LABEL_PREFIX + ".probe"
+    result = os.path.join(BASE, "probe-result.txt")
+    script = os.path.join(BASE, "probe.py")
+    plist = os.path.join(AGENTS_DIR, label + ".plist")
+    ensure_dirs()
+    for stale in (result, script):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+    with open(script, "w") as f:
+        f.write("import os, sys\n"
+                "try:\n"
+                "    n = len(os.listdir(sys.argv[1]))\n"
+                "    out = 'OK %d' % n\n"
+                "except Exception as exc:\n"
+                "    out = 'DENIED %s' % exc\n"
+                "open(sys.argv[2], 'w').write(out)\n")
+    try:
+        os.makedirs(AGENTS_DIR, exist_ok=True)
+        with open(plist, "wb") as f:
+            plistlib.dump({
+                "Label": label,
+                "ProgramArguments": [interpreter, script, path, result],
+                "RunAtLoad": True,
+            }, f)
+        domain = "gui/%d" % os.getuid()
+        launchctl("bootout", "%s/%s" % (domain, label))
+        code, _ = launchctl("bootstrap", domain, plist)
+        if code != 0:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(result):
+                with open(result) as f:
+                    return f.read().startswith("OK")
+            time.sleep(1)
+        return None
+    finally:
+        launchctl("bootout", "gui/%d/%s" % (os.getuid(), label))
+        for stale in (plist, script, result):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+
+
+def check(ok, label, detail=""):
+    mark = color("OK  ", GREEN) if ok else color("--  ", YELLOW)
+    info("  %s%s" % (mark, label))
+    if detail:
+        info("      " + DIM + detail + RESET)
+
+
+def cmd_doctor(cfg, args):
+    """Check everything vaultsync needs, and say plainly what is missing."""
+    info(color("vaultsync %s — checkup" % __version__, BOLD))
+    info("")
+    problems = []
+
+    rclone = find_binary(cfg, "rclone", "rclone")
+    if rclone:
+        _, lines, _ = rclone_lines(cfg, ["version"])
+        check(True, "rclone", (lines[0] if lines else rclone))
+    else:
+        problems.append("brew install rclone")
+        check(False, "rclone is missing", "needed for all syncing")
+
+    watcher = find_binary(cfg, "fswatch", "fswatch")
+    check(bool(watcher), "fswatch" if watcher else "fswatch is missing",
+          "instant reaction to local edits"
+          if watcher else "optional; without it, local edits wait for the poll")
+    if not watcher:
+        problems.append("brew install fswatch")
+
+    interpreter, trusted = daemon_python(cfg)
+    if trusted:
+        check(True, "background interpreter", interpreter)
+    else:
+        check(False, "only Apple's python3 is available",
+              "macOS blocks it from reading ~/Documents in the background")
+        problems.append("brew install python@3.13")
+
+    where = os.path.dirname(os.path.abspath(__file__))
+    on_path = any(os.path.realpath(d) == os.path.realpath(where)
+                  for d in os.environ.get("PATH", "").split(":") if d)
+    check(on_path, "vaultsync is on your PATH" if on_path
+          else "%s is not on your PATH" % where,
+          where if on_path else 'add:  export PATH="%s:$PATH"' % where)
+
+    # Google Drive
+    remote = cfg.get("remote", "gdrive")
+    remotes = []
+    if rclone:
+        _, lines, _ = rclone_lines(cfg, ["listremotes"])
+        remotes = [r.rstrip(":") for r in lines]
+    if remote in remotes:
+        code, lines, err = rclone_lines(cfg, ["about", remote + ":"])
+        if code == 0:
+            check(True, "Google Drive connected (%s:)" % remote,
+                  "; ".join(lines[:2]))
+        else:
+            check(False, "Google Drive remote '%s:' is not responding" % remote,
+                  summarize_error(err).splitlines()[-1] if err else "")
+            problems.append("vaultsync setup")
+        try:
+            drive_token(cfg)
+            check(True, "Google Docs mode available",
+                  "this remote has its own API client")
+        except DriveError as exc:
+            check(False, "Google Docs mode unavailable", str(exc))
+            info("      " + DIM + "see docs/google-oauth.md, then: vaultsync setup"
+                 + RESET)
+    else:
+        check(False, "Google Drive is not connected yet")
+        problems.append("vaultsync setup")
+
+    vaults = detect_vaults()
+    root = cfg.get("vault_root") or ""
+    if root:
+        check(True, "default vault", root)
+    elif vaults:
+        check(False, "no default vault chosen", "%d found" % len(vaults))
+        info("      " + DIM + "vaultsync vault %s" % vaults[0] + RESET)
+    else:
+        check(False, "no Obsidian vault found",
+              "you can still sync any folder by full path")
+
+    # The failure worth testing for directly.
+    target = root or (cfg["pairs"] and
+                      list(cfg["pairs"].values())[0].get("local")) or ""
+    if target and os.path.isdir(target):
+        info("")
+        info("  " + DIM + "testing whether a background agent can read your "
+             "vault..." + RESET)
+        allowed = probe_background_access(cfg, target)
+        if allowed is True:
+            check(True, "background access to your vault")
+        elif allowed is False:
+            check(False, "macOS is blocking background access to your vault")
+            info("      Grant Full Disk Access to:")
+            info("        %s" % interpreter)
+            info("      " + DIM + "System Settings > Privacy & Security > "
+                 "Full Disk Access" + RESET)
+            problems.append("grant Full Disk Access to " + interpreter)
+        else:
+            check(False, "could not test background access",
+                  "run `vaultsync doctor` again, or check `vaultsync logs`")
+
+    info("")
+    if problems:
+        info(color("To fix:", BOLD))
+        for item in dict.fromkeys(problems):
+            info("    %s" % item)
+        return 1
+    info(color("Everything checks out.", GREEN))
+    if not cfg["pairs"]:
+        info(DIM + 'Mirror a folder with:  vaultsync add "<folder>"' + RESET)
+    return 0
+
+# ---------------------------------------------------------------- misc
+
+
+def split_args(args, value_opts=(), flags=()):
+    """Split argv into (positional, options) so option values are never mistaken
+    for a pair name."""
+    positional, opts = [], {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-"):
+            key = a.lstrip("-")
+            if key in value_opts and i + 1 < len(args):
+                opts[value_opts[key]] = args[i + 1]
+                i += 2
+                continue
+            if key in flags:
+                opts[flags[key]] = True
+            i += 1
+            continue
+        positional.append(a)
+        i += 1
+    return positional, opts
+
+
+def parse_opts(args, spec, flags=()):
+    out = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            key = a[2:]
+            if key in flags:
+                out[key] = True
+                i += 1
+                continue
+            if key in spec and i + 1 < len(args):
+                out[key] = spec[key](args[i + 1])
+                i += 2
+                continue
+        i += 1
+    return out
+
+
+HELP = """\
+{bold}vaultsync{reset} — keep a vault folder and Google Drive mirrored, both ways.
+
+  {bold}Getting started{reset}
+    vaultsync setup                  guided first-time setup
+    vaultsync add "Project Notes"    mirror a folder and start syncing
+        --mode docs                  sync notes as native Google Docs
+        --remote PATH                Drive destination (default VaultSync/<Folder>)
+        --interval SECONDS           how often to poll Drive (default 120)
+        --no-start                   configure without starting the daemon
+    vaultsync mode <pair> docs       convert an existing folder to Google Docs
+    vaultsync adopt [pair]           turn stray plain .md in Drive into Docs
+
+  {bold}Day to day{reset}
+    vaultsync list                   folders being mirrored, and their state
+    vaultsync status [pair]          detail for one folder
+    vaultsync now [pair]             sync immediately  (-n for a dry run)
+    vaultsync check [pair]           show what a sync would change
+    vaultsync logs [pair] [-n 60]    recent activity  (-f to follow)
+
+  {bold}Background sync{reset}
+    vaultsync start [pair]           run continuously, and after reboot
+    vaultsync stop  [pair]           stop the background daemon
+
+  {bold}Version history{reset}
+    vaultsync history [pair]         every version that was replaced or discarded
+        --file NAME                  only versions of a given file
+    vaultsync restore <pair> <timestamp> <path>
+    vaultsync prune [--days 30]      delete archives older than N days
+
+  {bold}Health{reset}
+    vaultsync doctor                 check tools, auth and background access
+    vaultsync vault [path]           show or set your default vault
+    vaultsync version
+
+  {bold}Housekeeping{reset}
+    vaultsync resync [pair]          rebuild the baseline (newer copy wins)
+    vaultsync remove <pair>          stop mirroring  (--delete-drive to also
+                                     delete the Drive copy)
+    vaultsync uninstall              remove vaultsync itself (--purge for state)
+
+  {bold}How conflicts are handled{reset}
+    If a file changed on both sides, the newer timestamp wins so folders stay
+    clean. The version that lost, and anything a sync overwrote or deleted, is
+    archived to ~/.vaultsync/history — browse it with `vaultsync history`.
+
+    Exception, in docs mode: when a Doc is {bold}shared{reset} with anyone, both versions
+    are kept instead, because discarding one would throw away a collaborator's
+    work. The Doc's version is written beside the note for you to merge.
+    Sharing is read from Drive, so there is nothing to label by hand.
+
+  {bold}Google Docs mode{reset}
+    Each note lives in Drive as a real Google Doc you can share and comment on,
+    and edits made there flow back into the vault. Docs are addressed by file ID
+    and updated in place, so comments, sharing and Drive revision history all
+    survive, and no duplicate Doc is ever created.
+
+    Non-markdown files in the folder (images, PDFs) keep syncing as ordinary
+    files, so the mirror stays complete.
+
+    Google's markdown export is never byte-identical to the markdown that made
+    the Doc: it escapes punctuation, adds trailing hard breaks, and rewrites
+    table rules. Those are cleaned up on the way in. One kind of drift cannot be
+    undone — a soft line break inside a paragraph becomes a space — so vaultsync
+    only rewrites a note when the Doc genuinely changed, never as a side effect
+    of its own writes.
+
+    Per-folder option, set in {cfg}:
+      "always_keep_both": true   keep both versions on every conflict, not just
+                                 on Docs that are actually shared
+
+  Config: {cfg}
+  Filters (what to ignore): {filters}
+"""
+
+
+def cmd_help(cfg, args):
+    print(HELP.format(bold=BOLD if sys.stdout.isatty() else "",
+                      reset=RESET if sys.stdout.isatty() else "",
+                      cfg=CONFIG_PATH, filters=FILTERS_PATH))
+    return 0
+
+
+COMMANDS = {
+    "setup": cmd_setup,
+    "add": cmd_add,
+    "list": cmd_list,
+    "ls": cmd_list,
+    "status": cmd_status,
+    "now": cmd_now,
+    "sync": cmd_now,
+    "check": cmd_check,
+    "resync": cmd_resync,
+    "start": cmd_start,
+    "stop": cmd_stop,
+    "remove": cmd_remove,
+    "rm": cmd_remove,
+    "vault": cmd_vault,
+    "uninstall": cmd_uninstall,
+    "version": cmd_version,
+    "doctor": cmd_doctor,
+    "mode": cmd_mode,
+    "adopt": cmd_adopt,
+    "logs": cmd_logs,
+    "log": cmd_logs,
+    "history": cmd_history,
+    "versions": cmd_history,
+    "restore": cmd_restore,
+    "prune": cmd_prune,
+    "daemon": cmd_daemon,
+    "help": cmd_help,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        return cmd_help(None, [])
+    cmd = argv[0]
+    if cmd not in COMMANDS:
+        die("unknown command '%s'  (try: vaultsync help)" % cmd)
+    cfg = load_config()
+    return COMMANDS[cmd](cfg, argv[1:]) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

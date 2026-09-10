@@ -14,8 +14,12 @@ That folder now exists in Drive as real Google Docs. Edit a note in Obsidian and
 
 ```bash
 brew tap trevororton/vaultsync https://github.com/trevororton/vaultsync
+brew trust trevororton/vaultsync
 brew install vaultsync
 ```
+
+Homebrew asks you to trust any third-party tap before it will load a formula from
+it — that middle line is how you do it, and it is worth reading the formula first.
 
 No Homebrew? Same result:
 

@@ -23,7 +23,7 @@ class Vaultsync < Formula
   version "1.0.0"
 
   url "https://github.com/trevororton/vaultsync/archive/refs/tags/v1.0.0.tar.gz"
-  sha256 "2987cdd0e4eaa6d61f4114828280db9673d85bc1d979dd99483e950e113438af"
+  sha256 "833d9d2cb65a37c01531dc0d2a2737568ab7e299332eae39326a740d8e38cd87"
 
   head "https://github.com/trevororton/vaultsync.git", branch: "main"
 
